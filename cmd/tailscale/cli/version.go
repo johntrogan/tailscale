@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"os"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/clientupdate"
@@ -18,7 +17,7 @@ import (
 
 var versionCmd = &ffcli.Command{
 	Name:       "version",
-	ShortUsage: "version [flags]",
+	ShortUsage: "tailscale version [flags]",
 	ShortHelp:  "Print Tailscale version",
 	FlagSet: (func() *flag.FlagSet {
 		fs := newFlagSet("version")
@@ -70,7 +69,7 @@ func runVersion(ctx context.Context, args []string) error {
 			Meta:     m,
 			Upstream: upstreamVer,
 		}
-		e := json.NewEncoder(os.Stdout)
+		e := json.NewEncoder(Stdout)
 		e.SetIndent("", "\t")
 		return e.Encode(out)
 	}

@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mattn/go-colorable"
-	"github.com/mattn/go-isatty"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tka"
@@ -28,7 +26,7 @@ import (
 
 var netlockCmd = &ffcli.Command{
 	Name:       "lock",
-	ShortUsage: "lock <sub-command> <arguments>",
+	ShortUsage: "tailscale lock <subcommand> [arguments...]",
 	ShortHelp:  "Manage tailnet lock",
 	LongHelp:   "Manage tailnet lock",
 	Subcommands: []*ffcli.Command{
@@ -51,6 +49,9 @@ func runNetworkLockNoSubcommand(ctx context.Context, args []string) error {
 	if len(args) >= 2 && args[0] == "tskey-wrap" {
 		return runTskeyWrapCmd(ctx, args[1:])
 	}
+	if len(args) > 0 {
+		return fmt.Errorf("tailscale lock: unknown subcommand: %s", args[0])
+	}
 
 	return runNetworkLockStatus(ctx, args)
 }
@@ -63,7 +64,7 @@ var nlInitArgs struct {
 
 var nlInitCmd = &ffcli.Command{
 	Name:       "init",
-	ShortUsage: "init [--gen-disablement-for-support] --gen-disablements N <trusted-key>...",
+	ShortUsage: "tailscale lock init [--gen-disablement-for-support] --gen-disablements N <trusted-key>...",
 	ShortHelp:  "Initialize tailnet lock",
 	LongHelp: strings.TrimSpace(`
 
@@ -150,7 +151,7 @@ func runNetworkLockInit(ctx context.Context, args []string) error {
 	}
 
 	fmt.Printf("%d disablement secrets have been generated and are printed below. Take note of them now, they WILL NOT be shown again.\n", nlInitArgs.numDisablements)
-	for i := 0; i < nlInitArgs.numDisablements; i++ {
+	for range nlInitArgs.numDisablements {
 		var secret [32]byte
 		if _, err := rand.Read(secret[:]); err != nil {
 			return err
@@ -185,7 +186,7 @@ var nlStatusArgs struct {
 
 var nlStatusCmd = &ffcli.Command{
 	Name:       "status",
-	ShortUsage: "status",
+	ShortUsage: "tailscale lock status",
 	ShortHelp:  "Outputs the state of tailnet lock",
 	LongHelp:   "Outputs the state of tailnet lock",
 	Exec:       runNetworkLockStatus,
@@ -197,6 +198,10 @@ var nlStatusCmd = &ffcli.Command{
 }
 
 func runNetworkLockStatus(ctx context.Context, args []string) error {
+	if len(args) > 0 {
+		return fmt.Errorf("tailscale lock status: unexpected argument")
+	}
+
 	st, err := localClient.NetworkLockStatus(ctx)
 	if err != nil {
 		return fixTailscaledConnectError(err)
@@ -217,7 +222,8 @@ func runNetworkLockStatus(ctx context.Context, args []string) error {
 
 	if st.Enabled && st.NodeKey != nil && !st.PublicKey.IsZero() {
 		if st.NodeKeySigned {
-			fmt.Println("This node is accessible under tailnet lock.")
+			fmt.Println("This node is accessible under tailnet lock. Node signature:")
+			fmt.Println(st.NodeKeySignature.String())
 		} else {
 			fmt.Println("This node is LOCKED OUT by tailnet-lock, and action is required to establish connectivity.")
 			fmt.Printf("Run the following command on a node with a trusted key:\n\ttailscale lock sign %v %s\n", st.NodeKey, st.PublicKey.CLIString())
@@ -282,7 +288,7 @@ func runNetworkLockStatus(ctx context.Context, args []string) error {
 
 var nlAddCmd = &ffcli.Command{
 	Name:       "add",
-	ShortUsage: "add <public-key>...",
+	ShortUsage: "tailscale lock add <public-key>...",
 	ShortHelp:  "Adds one or more trusted signing keys to tailnet lock",
 	LongHelp:   "Adds one or more trusted signing keys to tailnet lock",
 	Exec: func(ctx context.Context, args []string) error {
@@ -296,7 +302,7 @@ var nlRemoveArgs struct {
 
 var nlRemoveCmd = &ffcli.Command{
 	Name:       "remove",
-	ShortUsage: "remove [--re-sign=false] <public-key>...",
+	ShortUsage: "tailscale lock remove [--re-sign=false] <public-key>...",
 	ShortHelp:  "Removes one or more trusted signing keys from tailnet lock",
 	LongHelp:   "Removes one or more trusted signing keys from tailnet lock",
 	Exec:       runNetworkLockRemove,
@@ -437,7 +443,7 @@ func runNetworkLockModify(ctx context.Context, addArgs, removeArgs []string) err
 
 var nlSignCmd = &ffcli.Command{
 	Name:       "sign",
-	ShortUsage: "sign <node-key> [<rotation-key>] or sign <auth-key>",
+	ShortUsage: "tailscale lock sign <node-key> [<rotation-key>] or sign <auth-key>",
 	ShortHelp:  "Signs a node or pre-approved auth key",
 	LongHelp: `Either:
   - signs a node key and transmits the signature to the coordination server, or
@@ -456,7 +462,7 @@ func runNetworkLockSign(ctx context.Context, args []string) error {
 	)
 
 	if len(args) == 0 || len(args) > 2 {
-		return errors.New("usage: lock sign <node-key> [<rotation-key>]")
+		return errors.New("usage: tailscale lock sign <node-key> [<rotation-key>]")
 	}
 	if err := nodeKey.UnmarshalText([]byte(args[0])); err != nil {
 		return fmt.Errorf("decoding node-key: %w", err)
@@ -471,17 +477,17 @@ func runNetworkLockSign(ctx context.Context, args []string) error {
 	// Provide a better help message for when someone clicks through the signing flow
 	// on the wrong device.
 	if err != nil && strings.Contains(err.Error(), "this node is not trusted by network lock") {
-		fmt.Fprintln(os.Stderr, "Error: Signing is not available on this device because it does not have a trusted tailnet lock key.")
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, "Try again on a signing device instead. Tailnet admins can see signing devices on the admin panel.")
-		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(Stderr, "Error: Signing is not available on this device because it does not have a trusted tailnet lock key.")
+		fmt.Fprintln(Stderr)
+		fmt.Fprintln(Stderr, "Try again on a signing device instead. Tailnet admins can see signing devices on the admin panel.")
+		fmt.Fprintln(Stderr)
 	}
 	return err
 }
 
 var nlDisableCmd = &ffcli.Command{
 	Name:       "disable",
-	ShortUsage: "disable <disablement-secret>",
+	ShortUsage: "tailscale lock disable <disablement-secret>",
 	ShortHelp:  "Consumes a disablement secret to shut down tailnet lock for the tailnet",
 	LongHelp: strings.TrimSpace(`
 
@@ -503,14 +509,14 @@ func runNetworkLockDisable(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(secrets) != 1 {
-		return errors.New("usage: lock disable <disablement-secret>")
+		return errors.New("usage: tailscale lock disable <disablement-secret>")
 	}
 	return localClient.NetworkLockDisable(ctx, secrets[0])
 }
 
 var nlLocalDisableCmd = &ffcli.Command{
 	Name:       "local-disable",
-	ShortUsage: "local-disable",
+	ShortUsage: "tailscale lock local-disable",
 	ShortHelp:  "Disables tailnet lock for this node only",
 	LongHelp: strings.TrimSpace(`
 
@@ -532,7 +538,7 @@ func runNetworkLockLocalDisable(ctx context.Context, args []string) error {
 
 var nlDisablementKDFCmd = &ffcli.Command{
 	Name:       "disablement-kdf",
-	ShortUsage: "disablement-kdf <hex-encoded-disablement-secret>",
+	ShortUsage: "tailscale lock disablement-kdf <hex-encoded-disablement-secret>",
 	ShortHelp:  "Computes a disablement value from a disablement secret (advanced users only)",
 	LongHelp:   "Computes a disablement value from a disablement secret (advanced users only)",
 	Exec:       runNetworkLockDisablementKDF,
@@ -540,7 +546,7 @@ var nlDisablementKDFCmd = &ffcli.Command{
 
 func runNetworkLockDisablementKDF(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: lock disablement-kdf <hex-encoded-disablement-secret>")
+		return errors.New("usage: tailscale lock disablement-kdf <hex-encoded-disablement-secret>")
 	}
 	secret, err := hex.DecodeString(args[0])
 	if err != nil {
@@ -557,7 +563,7 @@ var nlLogArgs struct {
 
 var nlLogCmd = &ffcli.Command{
 	Name:       "log",
-	ShortUsage: "log [--limit N]",
+	ShortUsage: "tailscale lock log [--limit N]",
 	ShortHelp:  "List changes applied to tailnet lock",
 	LongHelp:   "List changes applied to tailnet lock",
 	Exec:       runNetworkLockLog,
@@ -643,20 +649,19 @@ func runNetworkLockLog(ctx context.Context, args []string) error {
 		return fixTailscaledConnectError(err)
 	}
 	if nlLogArgs.json {
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(Stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(updates)
 	}
 
-	useColor := isatty.IsTerminal(os.Stdout.Fd())
+	out, useColor := colorableOutput()
 
-	stdOut := colorable.NewColorableStdout()
 	for _, update := range updates {
 		stanza, err := nlDescribeUpdate(update, useColor)
 		if err != nil {
 			return err
 		}
-		fmt.Fprintln(stdOut, stanza)
+		fmt.Fprintln(out, stanza)
 	}
 	return nil
 }
@@ -722,7 +727,7 @@ var nlRevokeKeysArgs struct {
 
 var nlRevokeKeysCmd = &ffcli.Command{
 	Name:       "revoke-keys",
-	ShortUsage: "revoke-keys <tailnet-lock-key>...\n  revoke-keys [--cosign] [--finish] <recovery-blob>",
+	ShortUsage: "tailscale lock revoke-keys <tailnet-lock-key>...\n  revoke-keys [--cosign] [--finish] <recovery-blob>",
 	ShortHelp:  "Revoke compromised tailnet-lock keys",
 	LongHelp: `Retroactively revoke the specified tailnet lock keys (tlpub:abc).
 

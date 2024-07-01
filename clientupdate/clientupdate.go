@@ -37,10 +37,17 @@ import (
 )
 
 const (
-	CurrentTrack  = ""
 	StableTrack   = "stable"
 	UnstableTrack = "unstable"
 )
+
+var CurrentTrack = func() string {
+	if version.IsUnstableBuild() {
+		return UnstableTrack
+	} else {
+		return StableTrack
+	}
+}()
 
 func versionToTrack(v string) (string, error) {
 	_, rest, ok := strings.Cut(v, ".")
@@ -106,7 +113,7 @@ func (args Arguments) validate() error {
 		return fmt.Errorf("only one of Version(%q) or Track(%q) can be set", args.Version, args.Track)
 	}
 	switch args.Track {
-	case StableTrack, UnstableTrack, CurrentTrack:
+	case StableTrack, UnstableTrack, "":
 		// All valid values.
 	default:
 		return fmt.Errorf("unsupported track %q", args.Track)
@@ -119,11 +126,17 @@ type Updater struct {
 	// Update is a platform-specific method that updates the installation. May be
 	// nil (not all platforms support updates from within Tailscale).
 	Update func() error
+
+	// currentVersion is the short form of the current client version as
+	// returned by version.Short(), typically "x.y.z". Used for tests to
+	// override the actual current version.
+	currentVersion string
 }
 
 func NewUpdater(args Arguments) (*Updater, error) {
 	up := Updater{
-		Arguments: args,
+		Arguments:      args,
+		currentVersion: version.Short(),
 	}
 	if up.Stdout == nil {
 		up.Stdout = os.Stdout
@@ -139,18 +152,15 @@ func NewUpdater(args Arguments) (*Updater, error) {
 	if args.ForAutoUpdate && !canAutoUpdate {
 		return nil, errors.ErrUnsupported
 	}
-	if up.Track == CurrentTrack {
-		switch {
-		case up.Version != "":
+	if up.Track == "" {
+		if up.Version != "" {
 			var err error
 			up.Track, err = versionToTrack(args.Version)
 			if err != nil {
 				return nil, err
 			}
-		case version.IsUnstableBuild():
-			up.Track = UnstableTrack
-		default:
-			up.Track = StableTrack
+		} else {
+			up.Track = CurrentTrack
 		}
 	}
 	if up.Arguments.PkgsAddr == "" {
@@ -259,13 +269,16 @@ func Update(args Arguments) error {
 }
 
 func (up *Updater) confirm(ver string) bool {
-	switch cmpver.Compare(version.Short(), ver) {
-	case 0:
-		up.Logf("already running %v version %v; no update needed", up.Track, ver)
-		return false
-	case 1:
-		up.Logf("installed %v version %v is newer than the latest available version %v; no update needed", up.Track, version.Short(), ver)
-		return false
+	// Only check version when we're not switching tracks.
+	if up.Track == "" || up.Track == CurrentTrack {
+		switch c := cmpver.Compare(up.currentVersion, ver); {
+		case c == 0:
+			up.Logf("already running %v version %v; no update needed", up.Track, ver)
+			return false
+		case c > 0:
+			up.Logf("installed %v version %v is newer than the latest available version %v; no update needed", up.Track, up.currentVersion, ver)
+			return false
+		}
 	}
 	if up.Confirm != nil {
 		return up.Confirm(ver)
@@ -436,7 +449,7 @@ func (up *Updater) updateDebLike() error {
 		return fmt.Errorf("apt-get update failed: %w; output:\n%s", err, out)
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		out, err := exec.Command("apt-get", "install", "--yes", "--allow-downgrades", "tailscale="+ver).CombinedOutput()
 		if err != nil {
 			if !bytes.Contains(out, []byte(`dpkg was interrupted`)) {
@@ -651,6 +664,9 @@ func (up *Updater) updateAlpineLike() (err error) {
 		return fmt.Errorf(`failed to parse latest version from "apk info tailscale": %w`, err)
 	}
 	if !up.confirm(ver) {
+		if err := checkOutdatedAlpineRepo(up.Logf, ver, up.Track); err != nil {
+			up.Logf("failed to check whether Alpine release is outdated: %v", err)
+		}
 		return nil
 	}
 
@@ -678,7 +694,7 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 			return "", fmt.Errorf("malformed info line: %q", line)
 		}
 		ver := parts[1]
-		if cmpver.Compare(ver, maxVer) == 1 {
+		if cmpver.Compare(ver, maxVer) > 0 {
 			maxVer = ver
 		}
 	}
@@ -686,6 +702,37 @@ func parseAlpinePackageVersion(out []byte) (string, error) {
 		return maxVer, nil
 	}
 	return "", errors.New("tailscale version not found in output")
+}
+
+var apkRepoVersionRE = regexp.MustCompile(`v[0-9]+\.[0-9]+`)
+
+func checkOutdatedAlpineRepo(logf logger.Logf, apkVer, track string) error {
+	latest, err := LatestTailscaleVersion(track)
+	if err != nil {
+		return err
+	}
+	if latest == apkVer {
+		// Actually on latest release.
+		return nil
+	}
+	f, err := os.Open("/etc/apk/repositories")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Read the first repo line. Typically, there are multiple repos that all
+	// contain the same version in the path, like:
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/main
+	//   https://dl-cdn.alpinelinux.org/alpine/v3.20/community
+	s := bufio.NewScanner(f)
+	if !s.Scan() {
+		return s.Err()
+	}
+	alpineVer := apkRepoVersionRE.FindString(s.Text())
+	if alpineVer != "" {
+		logf("The latest Tailscale release for Linux is %q, but your apk repository only provides %q.\nYour Alpine version is %q, you may need to upgrade the system to get the latest Tailscale version: https://wiki.alpinelinux.org/wiki/Upgrading_Alpine", latest, apkVer, alpineVer)
+	}
+	return nil
 }
 
 func (up *Updater) updateMacSys() error {
@@ -846,7 +893,7 @@ func (up *Updater) installMSI(msi string) error {
 			break
 		}
 		up.Logf("Install attempt failed: %v", err)
-		uninstallVersion := version.Short()
+		uninstallVersion := up.currentVersion
 		if v := os.Getenv("TS_DEBUG_UNINSTALL_VERSION"); v != "" {
 			uninstallVersion = v
 		}
@@ -1014,6 +1061,20 @@ func (up *Updater) updateLinuxBinary() error {
 		up.Logf("Success")
 	}
 
+	return nil
+}
+
+func restartSystemdUnit(ctx context.Context) error {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		// Likely not a systemd-managed distro.
+		return errors.ErrUnsupported
+	}
+	if out, err := exec.Command("systemctl", "daemon-reload").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl daemon-reload failed: %w\noutput: %s", err, out)
+	}
+	if out, err := exec.Command("systemctl", "restart", "tailscaled.service").CombinedOutput(); err != nil {
+		return fmt.Errorf("systemctl restart failed: %w\noutput: %s", err, out)
+	}
 	return nil
 }
 
@@ -1283,22 +1344,31 @@ func requestedTailscaleVersion(ver, track string) (string, error) {
 // LatestTailscaleVersion returns the latest released version for the given
 // track from pkgs.tailscale.com.
 func LatestTailscaleVersion(track string) (string, error) {
-	if track == CurrentTrack {
-		if version.IsUnstableBuild() {
-			track = UnstableTrack
-		} else {
-			track = StableTrack
-		}
+	if track == "" {
+		track = CurrentTrack
 	}
 
 	latest, err := latestPackages(track)
 	if err != nil {
 		return "", err
 	}
-	if latest.Version == "" {
-		return "", fmt.Errorf("no latest version found for %q track", track)
+	ver := latest.Version
+	switch runtime.GOOS {
+	case "windows":
+		ver = latest.MSIsVersion
+	case "darwin":
+		ver = latest.MacZipsVersion
+	case "linux":
+		ver = latest.TarballsVersion
+		if distro.Get() == distro.Synology {
+			ver = latest.SPKsVersion
+		}
 	}
-	return latest.Version, nil
+
+	if ver == "" {
+		return "", fmt.Errorf("no latest version found for OS %q on %q track", runtime.GOOS, track)
+	}
+	return ver, nil
 }
 
 type trackPackages struct {

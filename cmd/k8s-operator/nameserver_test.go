@@ -77,16 +77,16 @@ func TestNameserverReconciler(t *testing.T) {
 		svc.Spec.ClusterIP = "1.2.3.4"
 	})
 	expectReconciled(t, nr, "", "test")
-	dnsCfg.Status.NameserverStatus = &tsapi.NameserverStatus{
+	dnsCfg.Status.Nameserver = &tsapi.NameserverStatus{
 		IP: "1.2.3.4",
 	}
 	dnsCfg.Finalizers = []string{FinalizerName}
-	dnsCfg.Status.Conditions = append(dnsCfg.Status.Conditions, tsapi.ConnectorCondition{
-		Type:               tsapi.NameserverReady,
+	dnsCfg.Status.Conditions = append(dnsCfg.Status.Conditions, metav1.Condition{
+		Type:               string(tsapi.NameserverReady),
 		Status:             metav1.ConditionTrue,
 		Reason:             reasonNameserverCreated,
 		Message:            reasonNameserverCreated,
-		LastTransitionTime: &metav1.Time{Time: cl.Now().Truncate(time.Second)},
+		LastTransitionTime: metav1.Time{Time: cl.Now().Truncate(time.Second)},
 	})
 	expectEqual(t, fc, dnsCfg, nil)
 
@@ -105,14 +105,23 @@ func TestNameserverReconciler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error marshalling ConfigMap contents: %v", err)
 	}
-	mustUpdate(t, fc, "tailscale", "dnsconfig", func(cm *corev1.ConfigMap) {
-		mak.Set(&cm.Data, "dns.json", string(bs))
+	mustUpdate(t, fc, "tailscale", "dnsrecords", func(cm *corev1.ConfigMap) {
+		mak.Set(&cm.Data, "records.json", string(bs))
 	})
 	expectReconciled(t, nr, "", "test")
-	wantCm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "dnsconfig",
+	wantCm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "dnsrecords",
 		Namespace: "tailscale", Labels: labels, OwnerReferences: []metav1.OwnerReference{*dnsCfgOwnerRef}},
 		TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"},
-		Data:     map[string]string{"dns.json": string(bs)},
+		Data:     map[string]string{"records.json": string(bs)},
 	}
 	expectEqual(t, fc, wantCm, nil)
+
+	// Verify that if dnsconfig.spec.nameserver.image.{repo,tag} are unset,
+	// the nameserver image defaults to tailscale/k8s-nameserver:unstable.
+	mustUpdate(t, fc, "", "test", func(dnsCfg *tsapi.DNSConfig) {
+		dnsCfg.Spec.Nameserver.Image = nil
+	})
+	expectReconciled(t, nr, "", "test")
+	wantsDeploy.Spec.Template.Spec.Containers[0].Image = "tailscale/k8s-nameserver:unstable"
+	expectEqual(t, fc, wantsDeploy, nil)
 }

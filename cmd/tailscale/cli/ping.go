@@ -17,13 +17,14 @@ import (
 
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
 
 var pingCmd = &ffcli.Command{
 	Name:       "ping",
-	ShortUsage: "ping <hostname-or-IP>",
+	ShortUsage: "tailscale ping <hostname-or-IP>",
 	ShortHelp:  "Ping a host at the Tailscale layer, see how it routed",
 	LongHelp: strings.TrimSpace(`
 
@@ -57,6 +58,15 @@ relay node.
 		fs.IntVar(&pingArgs.size, "size", 0, "size of the ping message (disco pings only). 0 for minimum size.")
 		return fs
 	})(),
+}
+
+func init() {
+	ffcomplete.Args(pingCmd, func(args []string) ([]string, ffcomplete.ShellCompDirective, error) {
+		if len(args) > 1 {
+			return nil, ffcomplete.ShellCompDirectiveNoFileComp, nil
+		}
+		return completeHostOrIP(ffcomplete.LastArg(args))
+	})
 }
 
 var pingArgs struct {
@@ -95,7 +105,7 @@ func runPing(ctx context.Context, args []string) error {
 	}
 
 	if len(args) != 1 || args[0] == "" {
-		return errors.New("usage: ping <hostname-or-IP>")
+		return errors.New("usage: tailscale ping <hostname-or-IP>")
 	}
 	var ip string
 

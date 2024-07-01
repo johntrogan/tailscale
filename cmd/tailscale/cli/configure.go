@@ -4,7 +4,6 @@
 package cli
 
 import (
-	"context"
 	"flag"
 	"runtime"
 	"strings"
@@ -14,8 +13,9 @@ import (
 )
 
 var configureCmd = &ffcli.Command{
-	Name:      "configure",
-	ShortHelp: "[ALPHA] Configure the host to enable more Tailscale features",
+	Name:       "configure",
+	ShortUsage: "tailscale configure <subcommand>",
+	ShortHelp:  "[ALPHA] Configure the host to enable more Tailscale features",
 	LongHelp: strings.TrimSpace(`
 The 'configure' set of commands are intended to provide a way to enable different
 services on the host to use Tailscale in more ways.
@@ -25,9 +25,6 @@ services on the host to use Tailscale in more ways.
 		return fs
 	})(),
 	Subcommands: configureSubcommands(),
-	Exec: func(ctx context.Context, args []string) error {
-		return flag.ErrHelp
-	},
 }
 
 func configureSubcommands() (out []*ffcli.Command) {

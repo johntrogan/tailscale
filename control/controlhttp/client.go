@@ -32,12 +32,14 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"runtime"
 	"sort"
 	"sync/atomic"
 	"time"
 
 	"tailscale.com/control/controlbase"
 	"tailscale.com/envknob"
+	"tailscale.com/health"
 	"tailscale.com/net/dnscache"
 	"tailscale.com/net/dnsfallback"
 	"tailscale.com/net/netutil"
@@ -393,16 +395,32 @@ func (a *Dialer) resolver() *dnscache.Resolver {
 		LookupIPFallback: dnsfallback.MakeLookupFunc(a.logf, a.NetMon),
 		UseLastGood:      true,
 		Logf:             a.Logf, // not a.logf method; we want to propagate nil-ness
-		NetMon:           a.NetMon,
 	}
 }
+
+func isLoopback(a net.Addr) bool {
+	if ta, ok := a.(*net.TCPAddr); ok {
+		return ta.IP.IsLoopback()
+	}
+	return false
+}
+
+var macOSScreenTime = health.Register(&health.Warnable{
+	Code:     "macos-screen-time",
+	Severity: health.SeverityHigh,
+	Title:    "Tailscale blocked by Screen Time",
+	Text: func(args health.Args) string {
+		return "macOS Screen Time seems to be blocking Tailscale. Try disabling Screen Time in System Settings > Screen Time > Content & Privacy > Access to Web Content."
+	},
+	ImpactsConnectivity: true,
+})
 
 // tryURLUpgrade connects to u, and tries to upgrade it to a net.Conn. If addr
 // is valid, then no DNS is used and the connection will be made to the
 // provided address.
 //
 // Only the provided ctx is used, not a.ctx.
-func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr, init []byte) (net.Conn, error) {
+func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr, init []byte) (_ net.Conn, retErr error) {
 	var dns *dnscache.Resolver
 
 	// If we were provided an address to dial, then create a resolver that just
@@ -412,7 +430,6 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 			SingleHostStaticResult: []netip.Addr{addr},
 			SingleHost:             u.Hostname(),
 			Logf:                   a.Logf, // not a.logf method; we want to propagate nil-ness
-			NetMon:                 a.NetMon,
 		}
 	} else {
 		dns = a.resolver()
@@ -425,6 +442,30 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 		dialer = stdDialer.DialContext
 	}
 
+	// On macOS, see if Screen Time is blocking things.
+	if runtime.GOOS == "darwin" {
+		var proxydIntercepted atomic.Bool // intercepted by macOS webfilterproxyd
+		origDialer := dialer
+		dialer = func(ctx context.Context, network, address string) (net.Conn, error) {
+			c, err := origDialer(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			if isLoopback(c.LocalAddr()) && isLoopback(c.RemoteAddr()) {
+				proxydIntercepted.Store(true)
+			}
+			return c, nil
+		}
+		defer func() {
+			if retErr != nil && proxydIntercepted.Load() {
+				a.HealthTracker.SetUnhealthy(macOSScreenTime, nil)
+				retErr = fmt.Errorf("macOS Screen Time is blocking network access: %w", retErr)
+			} else {
+				a.HealthTracker.SetHealthy(macOSScreenTime)
+			}
+		}()
+	}
+
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	defer tr.CloseIdleConnections()
 	tr.Proxy = a.getProxyFunc()
@@ -433,7 +474,7 @@ func (a *Dialer) tryURLUpgrade(ctx context.Context, u *url.URL, addr netip.Addr,
 	// Disable HTTP2, since h2 can't do protocol switching.
 	tr.TLSClientConfig.NextProtos = []string{}
 	tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-	tr.TLSClientConfig = tlsdial.Config(a.Hostname, tr.TLSClientConfig)
+	tr.TLSClientConfig = tlsdial.Config(a.Hostname, a.HealthTracker, tr.TLSClientConfig)
 	if !tr.TLSClientConfig.InsecureSkipVerify {
 		panic("unexpected") // should be set by tlsdial.Config
 	}

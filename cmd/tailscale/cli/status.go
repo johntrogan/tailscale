@@ -23,13 +23,13 @@ import (
 	"golang.org/x/net/idna"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
-	"tailscale.com/net/interfaces"
+	"tailscale.com/net/netmon"
 	"tailscale.com/util/dnsname"
 )
 
 var statusCmd = &ffcli.Command{
 	Name:       "status",
-	ShortUsage: "status [--active] [--web] [--json]",
+	ShortUsage: "tailscale status [--active] [--web] [--json]",
 	ShortHelp:  "Show state of tailscaled and its connections",
 	LongHelp: strings.TrimSpace(`
 
@@ -102,7 +102,7 @@ func runStatus(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		statusURL := interfaces.HTTPOfListener(ln)
+		statusURL := netmon.HTTPOfListener(ln)
 		printf("Serving Tailscale status at %v ...\n", statusURL)
 		go func() {
 			<-ctx.Done()

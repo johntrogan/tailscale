@@ -38,7 +38,7 @@ func TestInterleave(t *testing.T) {
 func BenchmarkInterleave(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		Interleave(
 			[]int{1, 2, 3},
 			[]int{9, 8, 7},
@@ -48,7 +48,7 @@ func BenchmarkInterleave(b *testing.B) {
 
 func TestShuffle(t *testing.T) {
 	var sl []int
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		sl = append(sl, i)
 	}
 
@@ -134,5 +134,20 @@ func TestFilterNoAllocations(t *testing.T) {
 	// 1 alloc for 'src', nothing else
 	if allocs != 1 {
 		t.Fatalf("got %.4f allocs, want 1", allocs)
+	}
+}
+
+func TestAppendMatching(t *testing.T) {
+	v := []string{"one", "two", "three", "four"}
+	got := AppendMatching(v[:0], v, func(s string) bool { return len(s) > 3 })
+
+	want := []string{"three", "four"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v; want %v", got, want)
+	}
+
+	wantOrigMem := []string{"three", "four", "three", "four"}
+	if !reflect.DeepEqual(v, wantOrigMem) {
+		t.Errorf("got %v; want %v", v, wantOrigMem)
 	}
 }

@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"strings"
 	"text/tabwriter"
 
@@ -18,22 +17,23 @@ import (
 
 var whoisCmd = &ffcli.Command{
 	Name:       "whois",
-	ShortUsage: "whois [--json] ip[:port]",
+	ShortUsage: "tailscale whois [--json] ip[:port]",
 	ShortHelp:  "Show the machine and user associated with a Tailscale IP (v4 or v6)",
 	LongHelp: strings.TrimSpace(`
 	'tailscale whois' shows the machine and user associated with a Tailscale IP (v4 or v6).
 	`),
-	UsageFunc: usageFunc,
-	Exec:      runWhoIs,
+	Exec: runWhoIs,
 	FlagSet: func() *flag.FlagSet {
 		fs := newFlagSet("whois")
 		fs.BoolVar(&whoIsArgs.json, "json", false, "output in JSON format")
+		fs.StringVar(&whoIsArgs.proto, "proto", "", `protocol; one of "tcp" or "udp"; empty mans both `)
 		return fs
 	}(),
 }
 
 var whoIsArgs struct {
-	json bool // output in JSON format
+	json  bool   // output in JSON format
+	proto string // "tcp" or "udp"
 }
 
 func runWhoIs(ctx context.Context, args []string) error {
@@ -42,7 +42,7 @@ func runWhoIs(ctx context.Context, args []string) error {
 	} else if len(args) == 0 {
 		return errors.New("missing argument, expected one peer")
 	}
-	who, err := localClient.WhoIs(ctx, args[0])
+	who, err := localClient.WhoIsProto(ctx, whoIsArgs.proto, args[0])
 	if err != nil {
 		return err
 	}
@@ -53,7 +53,7 @@ func runWhoIs(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 10, 5, 5, ' ', 0)
+	w := tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)
 	fmt.Fprintf(w, "Machine:\n")
 	fmt.Fprintf(w, "  Name:\t%s\n", strings.TrimSuffix(who.Node.Name, "."))
 	fmt.Fprintf(w, "  ID:\t%s\n", who.Node.StableID)

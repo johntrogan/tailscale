@@ -291,7 +291,10 @@ func mkOutput(v verInfo) (VersionInfo, error) {
 		// so that we we're still in the same range. This way if Apple goes back to
 		// auto-incrementing the number for us, we can go back to it with
 		// reasonable-looking numbers.
-		ret.XcodeMacOS = fmt.Sprintf("%d.%d.%d", otherTime.Year()-1750, otherTime.YearDay(), otherTime.Hour()*60*60+otherTime.Minute()*60+otherTime.Second())
+		// In May 2024, a build with version number 275 was uploaded to the App Store
+		// by mistake, causing any 274.* build to be rejected. To address this, +1 was
+		// added, causing all builds to use the 275.* prefix.
+		ret.XcodeMacOS = fmt.Sprintf("%d.%d.%d", otherTime.Year()-1750+1, otherTime.YearDay(), otherTime.Hour()*60*60+otherTime.Minute()*60+otherTime.Second())
 	}
 
 	return ret, nil
@@ -333,11 +336,14 @@ type verInfo struct {
 const unknownPatchVersion = 9999999
 
 func infoFromCache(ref string, runner dirRunner) (verInfo, error) {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return verInfo{}, fmt.Errorf("Getting user cache dir: %w", err)
+	tailscaleCache := os.Getenv("TS_MKVERSION_OSS_GIT_CACHE")
+	if tailscaleCache == "" {
+		cacheDir, err := os.UserCacheDir()
+		if err != nil {
+			return verInfo{}, fmt.Errorf("Getting user cache dir: %w", err)
+		}
+		tailscaleCache = filepath.Join(cacheDir, "tailscale-oss")
 	}
-	tailscaleCache := filepath.Join(cacheDir, "tailscale-oss")
 	r := dirRunner(tailscaleCache)
 
 	if _, err := os.Stat(tailscaleCache); err != nil {

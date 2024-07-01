@@ -22,6 +22,7 @@ import (
 
 	"tailscale.com/control/controlbase"
 	"tailscale.com/net/dnscache"
+	"tailscale.com/net/netmon"
 	"tailscale.com/net/socks5"
 	"tailscale.com/net/tsdial"
 	"tailscale.com/tailcfg"
@@ -199,14 +200,17 @@ func testControlHTTP(t *testing.T, param httpTestParam) {
 		defer cancel()
 	}
 
+	netMon := netmon.NewStatic()
+	dialer := tsdial.NewDialer(netMon)
 	a := &Dialer{
 		Hostname:             "localhost",
 		HTTPPort:             strconv.Itoa(httpLn.Addr().(*net.TCPAddr).Port),
 		HTTPSPort:            strconv.Itoa(httpsLn.Addr().(*net.TCPAddr).Port),
 		MachineKey:           client,
 		ControlKey:           server.Public(),
+		NetMon:               netMon,
 		ProtocolVersion:      testProtocolVersion,
-		Dialer:               new(tsdial.Dialer).SystemDial,
+		Dialer:               dialer.SystemDial,
 		Logf:                 t.Logf,
 		omitCertErrorLogging: true,
 		testFallbackDelay:    fallbackDelay,
@@ -643,7 +647,7 @@ func TestDialPlan(t *testing.T) {
 
 			dialer := closeTrackDialer{
 				t:     t,
-				inner: new(tsdial.Dialer).SystemDial,
+				inner: tsdial.NewDialer(netmon.NewStatic()).SystemDial,
 				conns: make(map[*closeTrackConn]bool),
 			}
 			defer dialer.Done()
@@ -729,7 +733,7 @@ func (d *closeTrackDialer) Done() {
 	// Sleep/wait a few times on the assumption that things will close
 	// "eventually".
 	const iters = 100
-	for i := 0; i < iters; i++ {
+	for i := range iters {
 		d.mu.Lock()
 		if len(d.conns) == 0 {
 			d.mu.Unlock()

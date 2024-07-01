@@ -1,5 +1,5 @@
 IMAGE_REPO ?= tailscale/tailscale
-SYNO_ARCH ?= "amd64"
+SYNO_ARCH ?= "x86_64"
 SYNO_DSM ?= "7"
 TAGS ?= "latest"
 
@@ -107,6 +107,15 @@ publishdevnameserver: ## Build and publish k8s-nameserver image to location spec
 	@test "${REPO}" != "tailscale/k8s-nameserver" || (echo "REPO=... must not be tailscale/k8s-nameserver" && exit 1)
 	@test "${REPO}" != "ghcr.io/tailscale/k8s-nameserver" || (echo "REPO=... must not be ghcr.io/tailscale/k8s-nameserver" && exit 1)
 	TAGS="${TAGS}" REPOS=${REPO} PLATFORM=${PLATFORM} PUSH=true TARGET=k8s-nameserver ./build_docker.sh
+
+.PHONY: sshintegrationtest
+sshintegrationtest: ## Run the SSH integration tests in various Docker containers
+	@GOOS=linux GOARCH=amd64 ./tool/go test -tags integrationtest -c ./ssh/tailssh -o ssh/tailssh/testcontainers/tailssh.test && \
+	GOOS=linux GOARCH=amd64 ./tool/go build -o ssh/tailssh/testcontainers/tailscaled ./cmd/tailscaled && \
+	echo "Testing on ubuntu:focal" && docker build --build-arg="BASE=ubuntu:focal" -t ssh-ubuntu-focal ssh/tailssh/testcontainers && \
+	echo "Testing on ubuntu:jammy" && docker build --build-arg="BASE=ubuntu:jammy" -t ssh-ubuntu-jammy ssh/tailssh/testcontainers && \
+	echo "Testing on ubuntu:mantic" && docker build --build-arg="BASE=ubuntu:mantic" -t ssh-ubuntu-mantic ssh/tailssh/testcontainers && \
+	echo "Testing on ubuntu:noble" && docker build --build-arg="BASE=ubuntu:noble" -t ssh-ubuntu-noble ssh/tailssh/testcontainers
 
 help: ## Show this help
 	@echo "\nSpecify a command. The choices are:\n"

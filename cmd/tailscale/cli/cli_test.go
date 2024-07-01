@@ -16,6 +16,7 @@ import (
 
 	qt "github.com/frankban/quicktest"
 	"github.com/google/go-cmp/cmp"
+	"tailscale.com/envknob"
 	"tailscale.com/health/healthmsg"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -23,10 +24,115 @@ import (
 	"tailscale.com/tka"
 	"tailscale.com/tstest"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/opt"
 	"tailscale.com/types/persist"
 	"tailscale.com/types/preftype"
 	"tailscale.com/version/distro"
 )
+
+func TestPanicIfAnyEnvCheckedInInit(t *testing.T) {
+	envknob.PanicIfAnyEnvCheckedInInit()
+}
+
+func TestShortUsage(t *testing.T) {
+	t.Setenv("TAILSCALE_USE_WIP_CODE", "1")
+	if !envknob.UseWIPCode() {
+		t.Fatal("expected envknob.UseWIPCode() to be true")
+	}
+
+	walkCommands(newRootCmd(), func(w cmdWalk) bool {
+		c, parents := w.Command, w.parents
+
+		// Words that we expect to be in the usage.
+		words := make([]string, len(parents)+1)
+		for i, parent := range parents {
+			words[i] = parent.Name
+		}
+		words[len(parents)] = c.Name
+
+		// Check the ShortHelp starts with a capital letter.
+		if prefix, help := trimPrefixes(c.ShortHelp, "HIDDEN: ", "[ALPHA] ", "[BETA] "); help != "" {
+			if 'a' <= help[0] && help[0] <= 'z' {
+				if len(help) > 20 {
+					help = help[:20] + "…"
+				}
+				caphelp := string(help[0]-'a'+'A') + help[1:]
+				t.Errorf("command: %s: ShortHelp %q should start with a capital letter %q", strings.Join(words, " "), prefix+help, prefix+caphelp)
+			}
+		}
+
+		// Check all words appear in the usage.
+		usage := c.ShortUsage
+		for _, word := range words {
+			var ok bool
+			usage, ok = cutWord(usage, word)
+			if !ok {
+				full := strings.Join(words, " ")
+				t.Errorf("command: %s: usage %q should contain the full path %q", full, c.ShortUsage, full)
+				return true
+			}
+		}
+		return true
+	})
+}
+
+func trimPrefixes(full string, prefixes ...string) (trimmed, remaining string) {
+	s := full
+start:
+	for _, p := range prefixes {
+		var ok bool
+		s, ok = strings.CutPrefix(s, p)
+		if ok {
+			goto start
+		}
+	}
+	return full[:len(full)-len(s)], s
+}
+
+// cutWord("tailscale debug scale 123", "scale") returns (" 123", true).
+func cutWord(s, w string) (after string, ok bool) {
+	var p string
+	for {
+		p, s, ok = strings.Cut(s, w)
+		if !ok {
+			return "", false
+		}
+		if p != "" && isWordChar(p[len(p)-1]) {
+			continue
+		}
+		if s != "" && isWordChar(s[0]) {
+			continue
+		}
+		return s, true
+	}
+}
+
+func isWordChar(r byte) bool {
+	return r == '_' ||
+		('0' <= r && r <= '9') ||
+		('A' <= r && r <= 'Z') ||
+		('a' <= r && r <= 'z')
+}
+
+func TestCutWord(t *testing.T) {
+	tests := []struct {
+		in   string
+		word string
+		out  string
+		ok   bool
+	}{
+		{"tailscale debug", "debug", "", true},
+		{"tailscale debug", "bug", "", false},
+		{"tailscale debug", "tail", "", false},
+		{"tailscale debug scaley scale 123", "scale", " 123", true},
+	}
+	for _, test := range tests {
+		out, ok := cutWord(test.in, test.word)
+		if out != test.out || ok != test.ok {
+			t.Errorf("cutWord(%q, %q) = (%q, %t), wanted (%q, %t)", test.in, test.word, out, ok, test.out, test.ok)
+		}
+	}
+}
 
 // geese is a collection of gooses. It need not be complete.
 // But it should include anything handled specially (e.g. linux, windows)
@@ -71,9 +177,10 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "bare_up_means_up",
 			flags: []string{},
 			curPrefs: &ipn.Prefs{
-				ControlURL:  ipn.DefaultControlURL,
-				WantRunning: false,
-				Hostname:    "foo",
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         false,
+				Hostname:            "foo",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -81,12 +188,12 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "losing_hostname",
 			flags: []string{"--accept-dns"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      false,
-				Hostname:         "foo",
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				AllowSingleHosts: true,
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         false,
+				Hostname:            "foo",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --accept-dns --hostname=foo",
 		},
@@ -94,11 +201,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "hostname_changing_explicitly",
 			flags: []string{"--hostname=bar"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				AllowSingleHosts: true,
-				Hostname:         "foo",
+				ControlURL:          ipn.DefaultControlURL,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				Hostname:            "foo",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -106,11 +213,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "hostname_changing_empty_explicitly",
 			flags: []string{"--hostname="},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				AllowSingleHosts: true,
-				Hostname:         "foo",
+				ControlURL:          ipn.DefaultControlURL,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				Hostname:            "foo",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -126,11 +233,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "implicit_operator_change",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				OperatorUser:     "alice",
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				OperatorUser:        "alice",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			curUser: "eve",
 			want:    accidentalUpPrefix + " --hostname=foo --operator=alice",
@@ -139,11 +246,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "implicit_operator_matches_shell_user",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				OperatorUser:     "alice",
+				ControlURL:          ipn.DefaultControlURL,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				OperatorUser:        "alice",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			curUser: "alice",
 			want:    "",
@@ -152,15 +259,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "error_advertised_routes_exit_node_removed",
 			flags: []string{"--advertise-routes=10.0.42.0/24"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("10.0.42.0/24"),
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --advertise-routes=10.0.42.0/24 --advertise-exit-node",
 		},
@@ -168,15 +275,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "advertised_routes_exit_node_removed_explicit",
 			flags: []string{"--advertise-routes=10.0.42.0/24", "--advertise-exit-node=false"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("10.0.42.0/24"),
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -184,15 +291,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "advertised_routes_includes_the_0_routes", // but no --advertise-exit-node
 			flags: []string{"--advertise-routes=11.1.43.0/24,0.0.0.0/0,::/0"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("10.0.42.0/24"),
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -200,10 +307,10 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "advertise_exit_node", // Issue 1859
 			flags: []string{"--advertise-exit-node"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -211,14 +318,14 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "advertise_exit_node_over_existing_routes",
 			flags: []string{"--advertise-exit-node"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("1.2.0.0/16"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --advertise-exit-node --advertise-routes=1.2.0.0/16",
 		},
@@ -226,15 +333,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "advertise_exit_node_over_existing_routes_and_exit_node",
 			flags: []string{"--advertise-exit-node"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 					netip.MustParsePrefix("1.2.0.0/16"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --advertise-exit-node --advertise-routes=1.2.0.0/16",
 		},
@@ -242,12 +349,12 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "exit_node_clearing", // Issue 1777
 			flags: []string{"--exit-node="},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
-				ExitNodeID: "fooID",
+				ExitNodeID:          "fooID",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "",
 		},
@@ -255,59 +362,59 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "remove_all_implicit",
 			flags: []string{"--force-reauth"},
 			curPrefs: &ipn.Prefs{
-				WantRunning:      true,
-				ControlURL:       ipn.DefaultControlURL,
-				RouteAll:         true,
-				AllowSingleHosts: false,
-				ExitNodeIP:       netip.MustParseAddr("100.64.5.6"),
-				CorpDNS:          false,
-				ShieldsUp:        true,
-				AdvertiseTags:    []string{"tag:foo", "tag:bar"},
-				Hostname:         "myhostname",
-				ForceDaemon:      true,
+				WantRunning:   true,
+				ControlURL:    ipn.DefaultControlURL,
+				RouteAll:      true,
+				ExitNodeIP:    netip.MustParseAddr("100.64.5.6"),
+				CorpDNS:       false,
+				ShieldsUp:     true,
+				AdvertiseTags: []string{"tag:foo", "tag:bar"},
+				Hostname:      "myhostname",
+				ForceDaemon:   true,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("10.0.0.0/16"),
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
-				NetfilterMode: preftype.NetfilterNoDivert,
-				OperatorUser:  "alice",
+				NetfilterMode:       preftype.NetfilterNoDivert,
+				OperatorUser:        "alice",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			curUser: "eve",
-			want:    accidentalUpPrefix + " --force-reauth --accept-dns=false --accept-routes --advertise-exit-node --advertise-routes=10.0.0.0/16 --advertise-tags=tag:foo,tag:bar --exit-node=100.64.5.6 --host-routes=false --hostname=myhostname --netfilter-mode=nodivert --operator=alice --shields-up",
+			want:    accidentalUpPrefix + " --force-reauth --accept-dns=false --accept-routes --advertise-exit-node --advertise-routes=10.0.0.0/16 --advertise-tags=tag:foo,tag:bar --exit-node=100.64.5.6 --hostname=myhostname --netfilter-mode=nodivert --operator=alice --shields-up",
 		},
 		{
 			name:  "remove_all_implicit_except_hostname",
 			flags: []string{"--hostname=newhostname"},
 			curPrefs: &ipn.Prefs{
-				WantRunning:      true,
-				ControlURL:       ipn.DefaultControlURL,
-				RouteAll:         true,
-				AllowSingleHosts: false,
-				ExitNodeIP:       netip.MustParseAddr("100.64.5.6"),
-				CorpDNS:          false,
-				ShieldsUp:        true,
-				AdvertiseTags:    []string{"tag:foo", "tag:bar"},
-				Hostname:         "myhostname",
-				ForceDaemon:      true,
+				WantRunning:   true,
+				ControlURL:    ipn.DefaultControlURL,
+				RouteAll:      true,
+				ExitNodeIP:    netip.MustParseAddr("100.64.5.6"),
+				CorpDNS:       false,
+				ShieldsUp:     true,
+				AdvertiseTags: []string{"tag:foo", "tag:bar"},
+				Hostname:      "myhostname",
+				ForceDaemon:   true,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("10.0.0.0/16"),
 				},
-				NetfilterMode: preftype.NetfilterNoDivert,
-				OperatorUser:  "alice",
+				NetfilterMode:       preftype.NetfilterNoDivert,
+				OperatorUser:        "alice",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			curUser: "eve",
-			want:    accidentalUpPrefix + " --hostname=newhostname --accept-dns=false --accept-routes --advertise-routes=10.0.0.0/16 --advertise-tags=tag:foo,tag:bar --exit-node=100.64.5.6 --host-routes=false --netfilter-mode=nodivert --operator=alice --shields-up",
+			want:    accidentalUpPrefix + " --hostname=newhostname --accept-dns=false --accept-routes --advertise-routes=10.0.0.0/16 --advertise-tags=tag:foo,tag:bar --exit-node=100.64.5.6 --netfilter-mode=nodivert --operator=alice --shields-up",
 		},
 		{
 			name:  "loggedout_is_implicit",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				LoggedOut:        true,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				LoggedOut:           true,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "", // not an error. LoggedOut is implicit.
 		},
@@ -317,10 +424,9 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "make_windows_exit_node",
 			flags: []string{"--advertise-exit-node"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				RouteAll:         true,
+				ControlURL: ipn.DefaultControlURL,
+				CorpDNS:    true,
+				RouteAll:   true,
 
 				// And assume this no-op accidental pre-1.8 value:
 				NoSNAT: true,
@@ -332,8 +438,7 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "ignore_netfilter_change_non_linux",
 			flags: []string{"--accept-dns"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
+				ControlURL: ipn.DefaultControlURL,
 
 				NetfilterMode: preftype.NetfilterNoDivert, // we never had this bug, but pretend it got set non-zero on Windows somehow
 			},
@@ -344,15 +449,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "operator_losing_routes_step1", // https://twitter.com/EXPbits/status/1390418145047887877
 			flags: []string{"--operator=expbits"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 					netip.MustParsePrefix("1.2.0.0/16"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --operator=expbits --advertise-exit-node --advertise-routes=1.2.0.0/16",
 		},
@@ -360,15 +465,15 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "operator_losing_routes_step2", // https://twitter.com/EXPbits/status/1390418145047887877
 			flags: []string{"--operator=expbits", "--advertise-routes=1.2.0.0/16"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 					netip.MustParsePrefix("1.2.0.0/16"),
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --advertise-routes=1.2.0.0/16 --operator=expbits --advertise-exit-node",
 		},
@@ -376,13 +481,13 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "errors_preserve_explicit_flags",
 			flags: []string{"--reset", "--force-reauth=false", "--authkey=secretrand"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      false,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				AllowSingleHosts: true,
+				ControlURL:    ipn.DefaultControlURL,
+				WantRunning:   false,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
-				Hostname: "foo",
+				Hostname:            "foo",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --auth-key=secretrand --force-reauth=false --reset --hostname=foo",
 		},
@@ -390,12 +495,12 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "error_exit_node_omit_with_ip_pref",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
-				ExitNodeIP: netip.MustParseAddr("100.64.5.4"),
+				ExitNodeIP:          netip.MustParseAddr("100.64.5.4"),
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --hostname=foo --exit-node=100.64.5.4",
 		},
@@ -404,12 +509,12 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			flags:         []string{"--hostname=foo"},
 			curExitNodeIP: netip.MustParseAddr("100.64.5.7"),
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
-				ExitNodeID: "some_stable_id",
+				ExitNodeID:          "some_stable_id",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --hostname=foo --exit-node=100.64.5.7",
 		},
@@ -418,13 +523,13 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			flags:         []string{"--hostname=foo"},
 			curExitNodeIP: netip.MustParseAddr("100.2.3.4"),
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 
 				ExitNodeAllowLANAccess: true,
 				ExitNodeID:             "some_stable_id",
+				NoStatefulFiltering:    opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --hostname=foo --exit-node-allow-lan-access --exit-node=100.2.3.4",
 		},
@@ -432,10 +537,10 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "ignore_login_server_synonym",
 			flags: []string{"--login-server=https://controlplane.tailscale.com"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: "", // not an error
 		},
@@ -443,10 +548,10 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "ignore_login_server_synonym_on_other_change",
 			flags: []string{"--netfilter-mode=off"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				AllowSingleHosts: true,
-				CorpDNS:          false,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             false,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			want: accidentalUpPrefix + " --netfilter-mode=off --accept-dns=false",
 		},
@@ -456,11 +561,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "synology_permit_omit_accept_routes",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				RouteAll:         true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				RouteAll:            true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			goos:   "linux",
 			distro: distro.Synology,
@@ -472,11 +577,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "not_synology_dont_permit_omit_accept_routes",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				RouteAll:         true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				RouteAll:            true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			goos:   "linux",
 			distro: "", // not Synology
@@ -486,11 +591,11 @@ func TestCheckForAccidentalSettingReverts(t *testing.T) {
 			name:  "profile_name_ignored_in_up",
 			flags: []string{"--hostname=foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				NetfilterMode:    preftype.NetfilterOn,
-				ProfileName:      "foo",
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				ProfileName:         "foo",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			goos: "linux",
 			want: "",
@@ -550,12 +655,12 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			goos: "linux",
 			args: upArgsFromOSArgs("linux"),
 			want: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      true,
-				NoSNAT:           false,
-				NetfilterMode:    preftype.NetfilterOn,
-				CorpDNS:          true,
-				AllowSingleHosts: true,
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
+				CorpDNS:             true,
 				AutoUpdate: ipn.AutoUpdatePrefs{
 					Check: true,
 				},
@@ -566,12 +671,13 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			goos: "windows",
 			args: upArgsFromOSArgs("windows"),
 			want: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      true,
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				RouteAll:         true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				WantRunning:         true,
+				CorpDNS:             true,
+				RouteAll:            true,
+				NoSNAT:              false,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
 				AutoUpdate: ipn.AutoUpdatePrefs{
 					Check: true,
 				},
@@ -581,15 +687,15 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			name: "advertise_default_route",
 			args: upArgsFromOSArgs("linux", "--advertise-exit-node"),
 			want: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				WantRunning:      true,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
+				ControlURL:  ipn.DefaultControlURL,
+				WantRunning: true,
+				CorpDNS:     true,
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("0.0.0.0/0"),
 					netip.MustParsePrefix("::/0"),
 				},
-				NetfilterMode: preftype.NetfilterOn,
+				NoStatefulFiltering: "true",
+				NetfilterMode:       preftype.NetfilterOn,
 				AutoUpdate: ipn.AutoUpdatePrefs{
 					Check: true,
 				},
@@ -676,9 +782,10 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			},
 			wantWarn: "netfilter=nodivert; add iptables calls to ts-* chains manually.",
 			want: &ipn.Prefs{
-				WantRunning:   true,
-				NetfilterMode: preftype.NetfilterNoDivert,
-				NoSNAT:        true,
+				WantRunning:         true,
+				NetfilterMode:       preftype.NetfilterNoDivert,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
 				AutoUpdate: ipn.AutoUpdatePrefs{
 					Check: true,
 				},
@@ -692,9 +799,10 @@ func TestPrefsFromUpArgs(t *testing.T) {
 			},
 			wantWarn: "netfilter=off; configure iptables yourself.",
 			want: &ipn.Prefs{
-				WantRunning:   true,
-				NetfilterMode: preftype.NetfilterOff,
-				NoSNAT:        true,
+				WantRunning:         true,
+				NetfilterMode:       preftype.NetfilterOff,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
 				AutoUpdate: ipn.AutoUpdatePrefs{
 					Check: true,
 				},
@@ -708,8 +816,9 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				netfilterMode:   "off",
 			},
 			want: &ipn.Prefs{
-				WantRunning: true,
-				NoSNAT:      true,
+				WantRunning:         true,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("fd7a:115c:a1e0:b1a::bb:10.0.0.0/112"),
 				},
@@ -726,8 +835,9 @@ func TestPrefsFromUpArgs(t *testing.T) {
 				netfilterMode:   "off",
 			},
 			want: &ipn.Prefs{
-				WantRunning: true,
-				NoSNAT:      true,
+				WantRunning:         true,
+				NoSNAT:              true,
+				NoStatefulFiltering: "true",
 				AdvertiseRoutes: []netip.Prefix{
 					netip.MustParsePrefix("fd7a:115c:a1e0:b1a::aabb:10.0.0.0/112"),
 				},
@@ -803,12 +913,15 @@ func TestPrefFlagMapping(t *testing.T) {
 	}
 
 	prefType := reflect.TypeFor[ipn.Prefs]()
-	for i := 0; i < prefType.NumField(); i++ {
+	for i := range prefType.NumField() {
 		prefName := prefType.Field(i).Name
 		if prefHasFlag[prefName] {
 			continue
 		}
 		switch prefName {
+		case "AllowSingleHosts":
+			// Fake pref for downgrade compat. See #12058.
+			continue
 		case "WantRunning", "Persist", "LoggedOut":
 			// All explicitly handled (ignored) by checkForAccidentalSettingReverts.
 			continue
@@ -916,7 +1029,6 @@ func TestUpdatePrefs(t *testing.T) {
 			wantJustEditMP: &ipn.MaskedPrefs{
 				AdvertiseRoutesSet:        true,
 				AdvertiseTagsSet:          true,
-				AllowSingleHostsSet:       true,
 				AppConnectorSet:           true,
 				ControlURLSet:             true,
 				CorpDNSSet:                true,
@@ -926,6 +1038,7 @@ func TestUpdatePrefs(t *testing.T) {
 				HostnameSet:               true,
 				NetfilterModeSet:          true,
 				NoSNATSet:                 true,
+				NoStatefulFilteringSet:    true,
 				OperatorUserSet:           true,
 				RouteAllSet:               true,
 				RunSSHSet:                 true,
@@ -948,11 +1061,11 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "change_login_server",
 			flags: []string{"--login-server=https://localhost:1000"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			env:            upCheckEnv{backendState: "Running"},
 			wantSimpleUp:   true,
@@ -963,11 +1076,11 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "change_tags",
 			flags: []string{"--advertise-tags=tag:foo"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			env: upCheckEnv{backendState: "Running"},
 		},
@@ -976,11 +1089,11 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "explicit_empty_operator",
 			flags: []string{"--operator="},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				CorpDNS:          true,
-				AllowSingleHosts: true,
-				NetfilterMode:    preftype.NetfilterOn,
-				OperatorUser:     "somebody",
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				OperatorUser:        "somebody",
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			env: upCheckEnv{user: "somebody", backendState: "Running"},
 			wantJustEditMP: &ipn.MaskedPrefs{
@@ -997,11 +1110,11 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "enable_ssh",
 			flags: []string{"--ssh"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1018,12 +1131,12 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "disable_ssh",
 			flags: []string{"--ssh=false"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				RunSSH:           true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				RunSSH:              true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1043,12 +1156,12 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--ssh=false"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
-				RunSSH:           true,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				RunSSH:              true,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1067,11 +1180,11 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--ssh=true"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1090,11 +1203,11 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--ssh=true", "--accept-risk=lose-ssh"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1112,12 +1225,12 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--ssh=false", "--accept-risk=lose-ssh"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				Persist:          &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				RunSSH:           true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				Persist:             &persist.Persist{UserProfile: tailcfg.UserProfile{LoginName: "crawshaw.github"}},
+				CorpDNS:             true,
+				RunSSH:              true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				RunSSHSet:      true,
@@ -1135,10 +1248,10 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--force-reauth"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			env:          upCheckEnv{backendState: "Running"},
 			wantErrSubtr: "aborted, no changes made",
@@ -1148,10 +1261,10 @@ func TestUpdatePrefs(t *testing.T) {
 			flags:            []string{"--force-reauth", "--accept-risk=lose-ssh"},
 			sshOverTailscale: true,
 			curPrefs: &ipn.Prefs{
-				ControlURL:       "https://login.tailscale.com",
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          "https://login.tailscale.com",
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: nil,
 			env:            upCheckEnv{backendState: "Running"},
@@ -1160,10 +1273,10 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "advertise_connector",
 			flags: []string{"--advertise-connector"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:          ipn.DefaultControlURL,
+				CorpDNS:             true,
+				NetfilterMode:       preftype.NetfilterOn,
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				AppConnectorSet: true,
@@ -1180,13 +1293,13 @@ func TestUpdatePrefs(t *testing.T) {
 			name:  "no_advertise_connector",
 			flags: []string{"--advertise-connector=false"},
 			curPrefs: &ipn.Prefs{
-				ControlURL:       ipn.DefaultControlURL,
-				AllowSingleHosts: true,
-				CorpDNS:          true,
-				NetfilterMode:    preftype.NetfilterOn,
+				ControlURL:    ipn.DefaultControlURL,
+				CorpDNS:       true,
+				NetfilterMode: preftype.NetfilterOn,
 				AppConnector: ipn.AppConnectorPrefs{
 					Advertise: true,
 				},
+				NoStatefulFiltering: opt.NewBool(true),
 			},
 			wantJustEditMP: &ipn.MaskedPrefs{
 				AppConnectorSet: true,

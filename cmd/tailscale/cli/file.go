@@ -26,6 +26,7 @@ import (
 	"github.com/peterbourgon/ff/v3/ffcli"
 	"golang.org/x/time/rate"
 	"tailscale.com/client/tailscale/apitype"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/envknob"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/syncs"
@@ -38,17 +39,11 @@ import (
 
 var fileCmd = &ffcli.Command{
 	Name:       "file",
-	ShortUsage: "file <cp|get> ...",
+	ShortUsage: "tailscale file <cp|get> ...",
 	ShortHelp:  "Send or receive files",
 	Subcommands: []*ffcli.Command{
 		fileCpCmd,
 		fileGetCmd,
-	},
-	Exec: func(context.Context, []string) error {
-		// TODO(bradfitz): is there a better ffcli way to
-		// annotate subcommand-required commands that don't
-		// have an exec body of their own?
-		return errors.New("file subcommand required; run 'tailscale file -h' for details")
 	},
 }
 
@@ -65,7 +60,7 @@ func (c *countingReader) Read(buf []byte) (int, error) {
 
 var fileCpCmd = &ffcli.Command{
 	Name:       "cp",
-	ShortUsage: "file cp <files...> <target>:",
+	ShortUsage: "tailscale file cp <files...> <target>:",
 	ShortHelp:  "Copy file(s) to a host",
 	Exec:       runCp,
 	FlagSet: (func() *flag.FlagSet {
@@ -412,7 +407,7 @@ func (v *onConflict) Set(s string) error {
 
 var fileGetCmd = &ffcli.Command{
 	Name:       "get",
-	ShortUsage: "file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
+	ShortUsage: "tailscale file get [--wait] [--verbose] [--conflict=(skip|overwrite|rename)] <target-directory>",
 	ShortHelp:  "Move files out of the Tailscale file inbox",
 	Exec:       runFileGet,
 	FlagSet: (func() *flag.FlagSet {
@@ -420,10 +415,11 @@ var fileGetCmd = &ffcli.Command{
 		fs.BoolVar(&getArgs.wait, "wait", false, "wait for a file to arrive if inbox is empty")
 		fs.BoolVar(&getArgs.loop, "loop", false, "run get in a loop, receiving files as they come in")
 		fs.BoolVar(&getArgs.verbose, "verbose", false, "verbose output")
-		fs.Var(&getArgs.conflict, "conflict", `behavior when a conflicting (same-named) file already exists in the target directory.
+		fs.Var(&getArgs.conflict, "conflict", "`behavior`"+` when a conflicting (same-named) file already exists in the target directory.
 	skip:       skip conflicting files: leave them in the taildrop inbox and print an error. get any non-conflicting files
 	overwrite:  overwrite existing file
 	rename:     write to a new number-suffixed filename`)
+		ffcomplete.Flag(fs, "conflict", ffcomplete.Fixed("skip", "overwrite", "rename"))
 		return fs
 	})(),
 }
@@ -560,7 +556,7 @@ func runFileGetOneBatch(ctx context.Context, dir string) []error {
 
 func runFileGet(ctx context.Context, args []string) error {
 	if len(args) != 1 {
-		return errors.New("usage: file get <target-directory>")
+		return errors.New("usage: tailscale file get <target-directory>")
 	}
 	log.SetFlags(0)
 

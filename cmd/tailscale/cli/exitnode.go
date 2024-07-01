@@ -9,11 +9,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"text/tabwriter"
 
+	"github.com/kballard/go-shellquote"
 	"github.com/peterbourgon/ff/v3/ffcli"
 	xmaps "golang.org/x/exp/maps"
 	"tailscale.com/envknob"
@@ -21,45 +21,49 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-var exitNodeCmd = &ffcli.Command{
-	Name:       "exit-node",
-	ShortUsage: "exit-node [flags]",
-	ShortHelp:  "Show machines on your tailnet configured as exit nodes",
-	LongHelp:   "Show machines on your tailnet configured as exit nodes",
-	Exec: func(context.Context, []string) error {
-		return errors.New("exit-node subcommand required; run 'tailscale exit-node -h' for details")
-	},
-	Subcommands: append([]*ffcli.Command{
-		{
-			Name:       "list",
-			ShortUsage: "exit-node list [flags]",
-			ShortHelp:  "Show exit nodes",
-			Exec:       runExitNodeList,
-			FlagSet: (func() *flag.FlagSet {
-				fs := newFlagSet("list")
-				fs.StringVar(&exitNodeArgs.filter, "filter", "", "filter exit nodes by country")
-				return fs
-			})(),
-		}},
-		(func() []*ffcli.Command {
-			if !envknob.UseWIPCode() {
-				return nil
-			}
-			return []*ffcli.Command{
-				{
-					Name:       "connect",
-					ShortUsage: "exit-node connect",
-					ShortHelp:  "connect to most recently used exit node",
-					Exec:       exitNodeSetUse(true),
-				},
-				{
-					Name:       "disconnect",
-					ShortUsage: "exit-node disconnect",
-					ShortHelp:  "disconnect from current exit node, if any",
-					Exec:       exitNodeSetUse(false),
-				},
-			}
-		})()...),
+func exitNodeCmd() *ffcli.Command {
+	return &ffcli.Command{
+		Name:       "exit-node",
+		ShortUsage: "tailscale exit-node [flags]",
+		ShortHelp:  "Show machines on your tailnet configured as exit nodes",
+		Subcommands: append([]*ffcli.Command{
+			{
+				Name:       "list",
+				ShortUsage: "tailscale exit-node list [flags]",
+				ShortHelp:  "Show exit nodes",
+				Exec:       runExitNodeList,
+				FlagSet: (func() *flag.FlagSet {
+					fs := newFlagSet("list")
+					fs.StringVar(&exitNodeArgs.filter, "filter", "", "filter exit nodes by country")
+					return fs
+				})(),
+			},
+			{
+				Name:       "suggest",
+				ShortUsage: "tailscale exit-node suggest",
+				ShortHelp:  "Suggests the best available exit node",
+				Exec:       runExitNodeSuggest,
+			}},
+			(func() []*ffcli.Command {
+				if !envknob.UseWIPCode() {
+					return nil
+				}
+				return []*ffcli.Command{
+					{
+						Name:       "connect",
+						ShortUsage: "tailscale exit-node connect",
+						ShortHelp:  "Connect to most recently used exit node",
+						Exec:       exitNodeSetUse(true),
+					},
+					{
+						Name:       "disconnect",
+						ShortUsage: "tailscale exit-node disconnect",
+						ShortHelp:  "Disconnect from current exit node, if any",
+						Exec:       exitNodeSetUse(false),
+					},
+				}
+			})()...),
+	}
 }
 
 var exitNodeArgs struct {
@@ -121,7 +125,7 @@ func runExitNodeList(ctx context.Context, args []string) error {
 		return fmt.Errorf("no exit nodes found for %q", exitNodeArgs.filter)
 	}
 
-	w := tabwriter.NewWriter(os.Stdout, 10, 5, 5, ' ', 0)
+	w := tabwriter.NewWriter(Stdout, 10, 5, 5, ' ', 0)
 	defer w.Flush()
 	fmt.Fprintf(w, "\n %s\t%s\t%s\t%s\t%s\t", "IP", "HOSTNAME", "COUNTRY", "CITY", "STATUS")
 	for _, country := range filteredPeers.Countries {
@@ -133,9 +137,36 @@ func runExitNodeList(ctx context.Context, args []string) error {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the hostname or IP")
-
+	fmt.Fprintln(w, "# To use an exit node, use `tailscale set --exit-node=` followed by the hostname or IP.")
+	if hasAnyExitNodeSuggestions(peers) {
+		fmt.Fprintln(w, "# To have Tailscale suggest an exit node, use `tailscale exit-node suggest`.")
+	}
 	return nil
+}
+
+// runExitNodeSuggest returns a suggested exit node ID to connect to and shows the chosen exit node tailcfg.StableNodeID.
+// If there are no derp based exit nodes to choose from or there is a failure in finding a suggestion, the command will return an error indicating so.
+func runExitNodeSuggest(ctx context.Context, args []string) error {
+	res, err := localClient.SuggestExitNode(ctx)
+	if err != nil {
+		return fmt.Errorf("suggest exit node: %w", err)
+	}
+	if res.ID == "" {
+		fmt.Println("No exit node suggestion is available.")
+		return nil
+	}
+	hostname := strings.TrimSuffix(res.Name, ".")
+	fmt.Printf("Suggested exit node: %v\nTo accept this suggestion, use `tailscale set --exit-node=%v`.\n", hostname, shellquote.Join(hostname))
+	return nil
+}
+
+func hasAnyExitNodeSuggestions(peers []*ipnstate.PeerStatus) bool {
+	for _, peer := range peers {
+		if peer.HasCap(tailcfg.NodeAttrSuggestExitNode) {
+			return true
+		}
+	}
+	return false
 }
 
 // peerStatus returns a string representing the current state of

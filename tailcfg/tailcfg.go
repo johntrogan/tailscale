@@ -131,7 +131,18 @@ type CapabilityVersion int
 //   - 88: 2024-03-05: Client understands NodeAttrSuggestExitNode
 //   - 89: 2024-03-23: Client no longer respects deleted PeerChange.Capabilities (use CapMap)
 //   - 90: 2024-04-03: Client understands PeerCapabilityTaildrive.
-const CurrentCapabilityVersion CapabilityVersion = 90
+//   - 91: 2024-04-24: Client understands PeerCapabilityTaildriveSharer.
+//   - 92: 2024-05-06: Client understands NodeAttrUserDialUseRoutes.
+//   - 93: 2024-05-06: added support for stateful firewalling.
+//   - 94: 2024-05-06: Client understands Node.IsJailed.
+//   - 95: 2024-05-06: Client uses NodeAttrUserDialUseRoutes to change DNS dialing behavior.
+//   - 96: 2024-05-29: Client understands NodeAttrSSHBehaviorV1
+//   - 97: 2024-06-06: Client understands NodeAttrDisableSplitDNSWhenNoCustomResolvers
+//   - 98: 2024-06-13: iOS/tvOS clients may provide serial number as part of posture information
+//   - 99: 2024-06-14: Client understands NodeAttrDisableLocalDNSOverrideViaNRPT
+//   - 100: 2024-06-18: Client supports filtertype.Match.SrcCaps (issue #12542)
+//   - 101: 2024-07-01: Client supports SSH agent forwarding when handling connections with /bin/su
+const CurrentCapabilityVersion CapabilityVersion = 101
 
 type StableID string
 
@@ -252,6 +263,15 @@ func (m *RawMessage) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// MarshalCapJSON returns a capability rule in RawMessage string format.
+func MarshalCapJSON[T any](capRule T) (RawMessage, error) {
+	bs, err := json.Marshal(capRule)
+	if err != nil {
+		return "", fmt.Errorf("error marshalling capability rule: %w", err)
+	}
+	return RawMessage(string(bs)), nil
+}
+
 type Node struct {
 	ID       NodeID
 	StableID StableNodeID
@@ -340,6 +360,16 @@ type Node struct {
 	// CapMap with an empty value.
 	//
 	// See NodeCapability for more information on keys.
+	//
+	// Metadata about nodes can be transmitted in 3 ways:
+	// 1. MapResponse.Node.CapMap describes attributes that affect behavior for
+	//    this node, such as which features have been enabled through the admin
+	//    panel and any associated configuration details.
+	// 2. MapResponse.PacketFilter(s) describes access (both IP and application
+	//    based) that should be granted to peers.
+	// 3. MapResponse.Peers[].CapMap describes attributes regarding a peer node,
+	//    such as which features the peer supports or if that peer is preferred
+	//    for a particular task vs other peers that could also be chosen.
 	CapMap NodeCapMap `json:",omitempty"`
 
 	// UnsignedPeerAPIOnly means that this node is not signed nor subject to TKA
@@ -402,6 +432,11 @@ type Node struct {
 	// is not expected to speak Disco or DERP, and it must have Endpoints in
 	// order to be reachable.
 	IsWireGuardOnly bool `json:",omitempty"`
+
+	// IsJailed indicates that this node is jailed and should not be allowed
+	// initiate connections, however outbound connections to it should still be
+	// allowed.
+	IsJailed bool `json:",omitempty"`
 
 	// ExitNodeDNSResolvers is the list of DNS servers that should be used when this
 	// node is marked IsWireGuardOnly and being used as an exit node.
@@ -588,10 +623,11 @@ func isAlpha(b byte) bool {
 //
 // We might relax these rules later.
 func CheckTag(tag string) error {
-	if !strings.HasPrefix(tag, "tag:") {
+	var ok bool
+	tag, ok = strings.CutPrefix(tag, "tag:")
+	if !ok {
 		return errors.New("tags must start with 'tag:'")
 	}
-	tag = tag[4:]
 	if tag == "" {
 		return errors.New("tag names must not be empty")
 	}
@@ -650,14 +686,12 @@ type Service struct {
 	//        node's Tailscale IPv6 address.
 	//     * "peerapi-dns-proxy": the local peerapi service supports
 	//        being a DNS proxy (when the node is an exit
-	//        node). For this service, the Port number is really
-	//        the version number of the service.
+	//        node). For this service, the Port number must only be 1.
 	Proto ServiceProto
 
 	// Port is the port number.
 	//
-	// For Proto "peerapi-dns", it's the version number of the DNS proxy,
-	// currently 1.
+	// For Proto "peerapi-dns", it must be 1.
 	Port uint16
 
 	// Description is the textual description of the service,
@@ -1059,10 +1093,11 @@ func (st SignatureType) String() string {
 // in response to a RegisterRequest.
 type RegisterResponseAuth struct {
 	_ structs.Incomparable
-	// One of Provider/LoginName, Oauth2Token, or AuthKey is set.
-	Provider, LoginName string
-	Oauth2Token         *Oauth2Token
-	AuthKey             string
+
+	// At most one of Oauth2Token or AuthKey is set.
+
+	Oauth2Token *Oauth2Token `json:",omitempty"` // used by pre-1.66 Android only
+	AuthKey     string       `json:",omitempty"`
 }
 
 // RegisterRequest is sent by a client to register the key for a node.
@@ -1083,7 +1118,7 @@ type RegisterRequest struct {
 	NodeKey    key.NodePublic
 	OldNodeKey key.NodePublic
 	NLKey      key.NLPublic
-	Auth       RegisterResponseAuth
+	Auth       *RegisterResponseAuth `json:",omitempty"`
 	// Expiry optionally specifies the requested key expiry.
 	// The server policy may override.
 	// As a special case, if Expiry is in the past and NodeKey is
@@ -1300,7 +1335,7 @@ var PortRangeAny = PortRange{0, 65535}
 type NetPortRange struct {
 	_     structs.Incomparable
 	IP    string // IP, CIDR, Range, or "*" (same formats as FilterRule.SrcIPs)
-	Bits  *int   // deprecated; the old way to turn IP into a CIDR
+	Bits  *int   // deprecated; the 2020 way to turn IP into a CIDR. See FilterRule.SrcBits.
 	Ports PortRange
 }
 
@@ -1346,8 +1381,18 @@ const (
 	// PeerCapabilityWebUI grants the ability for a peer to edit features from the
 	// device Web UI.
 	PeerCapabilityWebUI PeerCapability = "tailscale.com/cap/webui"
-	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive shares.
+	// PeerCapabilityTaildrive grants the ability for a peer to access Taildrive
+	// shares.
 	PeerCapabilityTaildrive PeerCapability = "tailscale.com/cap/drive"
+	// PeerCapabilityTaildriveSharer indicates that a peer has the ability to
+	// share folders with us.
+	PeerCapabilityTaildriveSharer PeerCapability = "tailscale.com/cap/drive-sharer"
+
+	// PeerCapabilityKubernetes grants a peer Kubernetes-specific
+	// capabilities, such as the ability to impersonate specific Tailscale
+	// user groups as Kubernetes user groups. This capability is read by
+	// peers that are Tailscale Kubernetes operator instances.
+	PeerCapabilityKubernetes PeerCapability = "tailscale.com/cap/kubernetes"
 )
 
 // NodeCapMap is a map of capabilities to their optional values. It is valid for
@@ -1427,7 +1472,7 @@ func (c PeerCapMap) HasCapability(cap PeerCapability) bool {
 // FilterRule represents one rule in a packet filter.
 //
 // A rule is logically a set of source CIDRs to match (described by
-// SrcIPs and SrcBits), and a set of destination targets that are then
+// SrcIPs), and a set of destination targets that are then
 // allowed if a source IP is matches of those CIDRs.
 type FilterRule struct {
 	// SrcIPs are the source IPs/networks to match.
@@ -1437,9 +1482,10 @@ type FilterRule struct {
 	//     * the string "*" to match everything (both IPv4 & IPv6)
 	//     * a CIDR (e.g. "192.168.0.0/16")
 	//     * a range of two IPs, inclusive, separated by hyphen ("2eff::1-2eff::0800")
+	//     * a string "cap:<capability>" with NodeCapMap cap name
 	SrcIPs []string
 
-	// SrcBits is deprecated; it's the old way to specify a CIDR
+	// SrcBits is deprecated; it was the old way to specify a CIDR
 	// prior to CapabilityVersion 7. Its values correspond to the
 	// SrcIPs above.
 	//
@@ -1450,10 +1496,14 @@ type FilterRule struct {
 	// position is 32, as if the SrcIPs above were a /32 mask. For
 	// a "*" SrcIPs value, the corresponding SrcBits value is
 	// ignored.
+	//
+	// This is still present in this file because the Tailscale control plane
+	// code still uses this type, for 118 clients that are still connected as of
+	// 2024-06-18, 3.5 years after the last release that used this type.
 	SrcBits []int `json:",omitempty"`
 
 	// DstPorts are the port ranges to allow once a source IP
-	// matches (is in the CIDR described by SrcIPs & SrcBits).
+	// matches (is in the CIDR described by SrcIPs).
 	//
 	// CapGrant and DstPorts are mutually exclusive: at most one can be non-nil.
 	DstPorts []NetPortRange `json:",omitempty"`
@@ -1484,11 +1534,9 @@ type FilterRule struct {
 
 var FilterAllowAll = []FilterRule{
 	{
-		SrcIPs:  []string{"*"},
-		SrcBits: nil,
+		SrcIPs: []string{"*"},
 		DstPorts: []NetPortRange{{
 			IP:    "*",
-			Bits:  nil,
 			Ports: PortRange{0, 65535},
 		}},
 	},
@@ -2028,7 +2076,8 @@ func (n *Node) Equal(n2 *Node) bool {
 		n.Expired == n2.Expired &&
 		eqPtr(n.SelfNodeV4MasqAddrForThisPeer, n2.SelfNodeV4MasqAddrForThisPeer) &&
 		eqPtr(n.SelfNodeV6MasqAddrForThisPeer, n2.SelfNodeV6MasqAddrForThisPeer) &&
-		n.IsWireGuardOnly == n2.IsWireGuardOnly
+		n.IsWireGuardOnly == n2.IsWireGuardOnly &&
+		n.IsJailed == n2.IsJailed
 }
 
 func eqPtr[T comparable](a, b *T) bool {
@@ -2231,6 +2280,47 @@ const (
 
 	// NodeAttrDisableWebClient disables using the web client.
 	NodeAttrDisableWebClient NodeCapability = "disable-web-client"
+
+	// NodeAttrLogExitFlows enables exit node destinations in network flow logs.
+	NodeAttrLogExitFlows NodeCapability = "log-exit-flows"
+
+	// NodeAttrAutoExitNode permits the automatic exit nodes feature.
+	NodeAttrAutoExitNode NodeCapability = "auto-exit-node"
+
+	// NodeAttrStoreAppCRoutes configures the node to store app connector routes persistently.
+	NodeAttrStoreAppCRoutes NodeCapability = "store-appc-routes"
+
+	// NodeAttrSuggestExitNodeUI allows the currently suggested exit node to appear in the client GUI.
+	NodeAttrSuggestExitNodeUI NodeCapability = "suggest-exit-node-ui"
+
+	// NodeAttrUserDialUseRoutes makes UserDial use either the peer dialer or the system dialer,
+	// depending on the destination address and the configured routes. When present, it also makes
+	// the DNS forwarder use UserDial instead of SystemDial when dialing resolvers.
+	NodeAttrUserDialUseRoutes NodeCapability = "user-dial-routes"
+
+	// NodeAttrSSHBehaviorV1 forces SSH to use the V1 behavior (no su, run SFTP in-process)
+	// Added 2024-05-29 in Tailscale version 1.68.
+	NodeAttrSSHBehaviorV1 NodeCapability = "ssh-behavior-v1"
+
+	// NodeAttrDisableSplitDNSWhenNoCustomResolvers indicates that the node's
+	// DNS manager should not adopt a split DNS configuration even though the
+	// Config of the resolver only contains routes that do not specify custom
+	// resolver(s), hence all DNS queries can be safely sent to the upstream
+	// DNS resolver and the node's DNS forwarder doesn't need to handle all
+	// DNS traffic.
+	// This is for now (2024-06-06) an iOS-specific battery life optimization,
+	// and this node attribute allows us to disable the optimization remotely
+	// if needed.
+	NodeAttrDisableSplitDNSWhenNoCustomResolvers NodeCapability = "disable-split-dns-when-no-custom-resolvers"
+
+	// NodeAttrDisableLocalDNSOverrideViaNRPT indicates that the node's DNS manager should not
+	// create a default (catch-all) Windows NRPT rule when "Override local DNS" is enabled.
+	// Without this rule, Windows 8.1 and newer devices issue parallel DNS requests to DNS servers
+	// associated with all network adapters, even when "Override local DNS" is enabled and/or
+	// a Mullvad exit node is being used, resulting in DNS leaks.
+	// We began creating this rule on 2024-06-14, and this node attribute
+	// allows us to disable the new behavior remotely if needed.
+	NodeAttrDisableLocalDNSOverrideViaNRPT NodeCapability = "disable-local-dns-override-via-nrpt"
 )
 
 // SetDNSRequest is a request to add a DNS record.

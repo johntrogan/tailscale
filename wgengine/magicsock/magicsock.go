@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/tailscale/wireguard-go/conn"
@@ -32,7 +33,6 @@ import (
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/connstats"
-	"tailscale.com/net/interfaces"
 	"tailscale.com/net/netcheck"
 	"tailscale.com/net/neterror"
 	"tailscale.com/net/netmon"
@@ -89,7 +89,8 @@ type Conn struct {
 	idleFunc               func() time.Duration // nil means unknown
 	testOnlyPacketListener nettype.PacketListener
 	noteRecvActivity       func(key.NodePublic) // or nil, see Options.NoteRecvActivity
-	netMon                 *netmon.Monitor      // or nil
+	netMon                 *netmon.Monitor      // must be non-nil
+	health                 *health.Tracker      // or nil
 	controlKnobs           *controlknobs.Knobs  // or nil
 
 	// ================================================================
@@ -305,6 +306,10 @@ type Conn struct {
 	// getPeerByKey optionally specifies a function to look up a peer's
 	// wireguard state by its public key. If nil, it's not used.
 	getPeerByKey func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// lastEPERMRebind tracks the last time a rebind was performed
+	// after experiencing a syscall.EPERM.
+	lastEPERMRebind syncs.AtomicValue[time.Time]
 }
 
 // SetDebugLoggingEnabled controls whether spammy debug logging is enabled.
@@ -364,8 +369,12 @@ type Options struct {
 	NoteRecvActivity func(key.NodePublic)
 
 	// NetMon is the network monitor to use.
-	// With one, the portmapper won't be used.
+	// It must be non-nil.
 	NetMon *netmon.Monitor
+
+	// HealthTracker optionally specifies the health tracker to
+	// report errors and warnings to.
+	HealthTracker *health.Tracker
 
 	// ControlKnobs are the set of control knobs to use.
 	// If nil, they're ignored and not updated.
@@ -379,6 +388,10 @@ type Options struct {
 	// WireGuard state by its public key. If nil, it's not used.
 	// In regular use, this will be wgengine.(*userspaceEngine).PeerByKey.
 	PeerByKeyFunc func(key.NodePublic) (_ wgint.Peer, ok bool)
+
+	// DisablePortMapper, if true, disables the portmapper.
+	// This is primarily useful in tests.
+	DisablePortMapper bool
 }
 
 func (o *Options) logf() logger.Logf {
@@ -437,6 +450,10 @@ func newConn() *Conn {
 // As the set of possible endpoints for a Conn changes, the
 // callback opts.EndpointsFunc is called.
 func NewConn(opts Options) (*Conn, error) {
+	if opts.NetMon == nil {
+		return nil, errors.New("magicsock.Options.NetMon must be non-nil")
+	}
+
 	c := newConn()
 	c.port.Store(uint32(opts.Port))
 	c.controlKnobs = opts.ControlKnobs
@@ -447,13 +464,12 @@ func NewConn(opts Options) (*Conn, error) {
 	c.testOnlyPacketListener = opts.TestOnlyPacketListener
 	c.noteRecvActivity = opts.NoteRecvActivity
 	portMapOpts := &portmapper.DebugKnobs{
-		DisableAll: func() bool { return c.onlyTCP443.Load() },
+		DisableAll: func() bool { return opts.DisablePortMapper || c.onlyTCP443.Load() },
 	}
 	c.portMapper = portmapper.NewClient(logger.WithPrefix(c.logf, "portmapper: "), opts.NetMon, portMapOpts, opts.ControlKnobs, c.onPortMapChanged)
-	if opts.NetMon != nil {
-		c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
-	}
+	c.portMapper.SetGatewayLookupFunc(opts.NetMon.GatewayAndSelfIP)
 	c.netMon = opts.NetMon
+	c.health = opts.HealthTracker
 	c.onPortUpdate = opts.OnPortUpdate
 	c.getPeerByKey = opts.PeerByKeyFunc
 
@@ -657,7 +673,7 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 		// NOTE(andrew-d): I don't love that we're depending on the
 		// health package here, but I'd rather do that and not store
 		// the exact same state in two different places.
-		GetLastDERPActivity: health.GetDERPRegionReceivedTime,
+		GetLastDERPActivity: c.health.GetDERPRegionReceivedTime,
 	})
 	if err != nil {
 		return nil, err
@@ -671,7 +687,6 @@ func (c *Conn) updateNetInfo(ctx context.Context) (*netcheck.Report, error) {
 	ni := &tailcfg.NetInfo{
 		DERPLatency:           map[string]float64{},
 		MappingVariesByDestIP: report.MappingVariesByDestIP,
-		HairPinning:           report.HairPinning,
 		UPnP:                  report.UPnP,
 		PMP:                   report.PMP,
 		PCP:                   report.PCP,
@@ -884,22 +899,23 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 		c.setNetInfoHavePortMap()
 	}
 
-	if nr.GlobalV4 != "" {
-		addAddr(ipp(nr.GlobalV4), tailcfg.EndpointSTUN)
+	v4Addrs, v6Addrs := nr.GetGlobalAddrs()
+	for _, addr := range v4Addrs {
+		addAddr(addr, tailcfg.EndpointSTUN)
+	}
+	for _, addr := range v6Addrs {
+		addAddr(addr, tailcfg.EndpointSTUN)
+	}
 
+	if len(v4Addrs) >= 1 {
 		// If they're behind a hard NAT and are using a fixed
 		// port locally, assume they might've added a static
 		// port mapping on their router to the same explicit
 		// port that tailscaled is running with. Worst case
 		// it's an invalid candidate mapping.
 		if port := c.port.Load(); nr.MappingVariesByDestIP.EqualBool(true) && port != 0 {
-			if ip, _, err := net.SplitHostPort(nr.GlobalV4); err == nil {
-				addAddr(ipp(net.JoinHostPort(ip, strconv.Itoa(int(port)))), tailcfg.EndpointSTUN4LocalPort)
-			}
+			addAddr(netip.AddrPortFrom(v4Addrs[0].Addr(), uint16(port)), tailcfg.EndpointSTUN4LocalPort)
 		}
-	}
-	if nr.GlobalV6 != "" {
-		addAddr(ipp(nr.GlobalV6), tailcfg.EndpointSTUN)
 	}
 
 	// Update our set of endpoints by adding any endpoints that we
@@ -919,7 +935,7 @@ func (c *Conn) determineEndpoints(ctx context.Context) ([]tailcfg.Endpoint, erro
 	eps = c.endpointTracker.update(time.Now(), eps)
 
 	if localAddr := c.pconn4.LocalAddr(); localAddr.IP.IsUnspecified() {
-		ips, loopback, err := interfaces.LocalAddresses()
+		ips, loopback, err := netmon.LocalAddresses()
 		if err != nil {
 			return nil, err
 		}
@@ -1047,6 +1063,8 @@ func (c *Conn) sendUDPBatch(addr netip.AddrPort, buffs [][]byte) (sent bool, err
 		if errors.As(err, &errGSO) {
 			c.logf("magicsock: %s", errGSO.Error())
 			err = errGSO.RetryErr
+		} else {
+			_ = c.maybeRebindOnError(runtime.GOOS, err)
 		}
 	}
 	return err == nil, err
@@ -1061,12 +1079,41 @@ func (c *Conn) sendUDP(ipp netip.AddrPort, b []byte) (sent bool, err error) {
 	sent, err = c.sendUDPStd(ipp, b)
 	if err != nil {
 		metricSendUDPError.Add(1)
+		_ = c.maybeRebindOnError(runtime.GOOS, err)
 	} else {
 		if sent {
 			metricSendUDP.Add(1)
 		}
 	}
 	return
+}
+
+// maybeRebindOnError performs a rebind and restun if the error is defined and
+// any conditionals are met.
+func (c *Conn) maybeRebindOnError(os string, err error) bool {
+	switch err {
+	case syscall.EPERM:
+		why := "operation-not-permitted-rebind"
+		switch os {
+		// We currently will only rebind and restun on a syscall.EPERM if it is experienced
+		// on a client running darwin.
+		// TODO(charlotte, raggi): expand os options if required.
+		case "darwin":
+			// TODO(charlotte): implement a backoff, so we don't end up in a rebind loop for persistent
+			// EPERMs.
+			if c.lastEPERMRebind.Load().Before(time.Now().Add(-5 * time.Second)) {
+				c.logf("magicsock: performing %q", why)
+				c.lastEPERMRebind.Store(time.Now())
+				c.Rebind()
+				go c.ReSTUN(why)
+				return true
+			}
+		default:
+			c.logf("magicsock: not performing %q", why)
+			return false
+		}
+	}
+	return false
 }
 
 // sendUDP sends UDP packet b to addr.
@@ -1157,12 +1204,12 @@ func (c *Conn) putReceiveBatch(batch *receiveBatch) {
 
 // receiveIPv4 creates an IPv4 ReceiveFunc reading from c.pconn4.
 func (c *Conn) receiveIPv4() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn4, &health.ReceiveIPv4, metricRecvDataIPv4)
+	return c.mkReceiveFunc(&c.pconn4, c.health.ReceiveFuncStats(health.ReceiveIPv4), metricRecvDataIPv4)
 }
 
 // receiveIPv6 creates an IPv6 ReceiveFunc reading from c.pconn6.
 func (c *Conn) receiveIPv6() conn.ReceiveFunc {
-	return c.mkReceiveFunc(&c.pconn6, &health.ReceiveIPv6, metricRecvDataIPv6)
+	return c.mkReceiveFunc(&c.pconn6, c.health.ReceiveFuncStats(health.ReceiveIPv6), metricRecvDataIPv6)
 }
 
 // mkReceiveFunc creates a ReceiveFunc reading from ruc.
@@ -1389,10 +1436,10 @@ func (c *Conn) handleDiscoMessage(msg []byte, src netip.AddrPort, derpNodeSrc ke
 		return
 	}
 
-	if !c.peerMap.anyEndpointForDiscoKey(sender) {
+	if !c.peerMap.knownPeerDiscoKey(sender) {
 		metricRecvDiscoBadPeer.Add(1)
 		if debugDisco() {
-			c.logf("magicsock: disco: ignoring disco-looking frame, don't know endpoint for %v", sender.ShortString())
+			c.logf("magicsock: disco: ignoring disco-looking frame, don't know of key %v", sender.ShortString())
 		}
 		return
 	}
@@ -2050,7 +2097,7 @@ func (c *Conn) SetNetworkMap(nm *netmap.NetworkMap) {
 
 	// discokeys might have changed in the above. Discard unused info.
 	for dk := range c.discoInfo {
-		if !c.peerMap.anyEndpointForDiscoKey(dk) {
+		if !c.peerMap.knownPeerDiscoKey(dk) {
 			delete(c.discoInfo, dk)
 		}
 	}
@@ -2431,7 +2478,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 		}
 		ruc.setConnLocked(pconn, network, c.bind.BatchSize())
 		if network == "udp4" {
-			health.SetUDP4Unbound(false)
+			c.health.SetUDP4Unbound(false)
 		}
 		return nil
 	}
@@ -2442,7 +2489,7 @@ func (c *Conn) bindSocket(ruc *RebindingUDPConn, network string, curPortFate cur
 	// we get a link change and we can try binding again.
 	ruc.setConnLocked(newBlockForeverConn(), "", c.bind.BatchSize())
 	if network == "udp4" {
-		health.SetUDP4Unbound(true)
+		c.health.SetUDP4Unbound(true)
 	}
 	return fmt.Errorf("failed to bind any ports (tried %v)", ports)
 }
@@ -2981,6 +3028,17 @@ var (
 	// changed from non-zero to a different non-zero.
 	metricDERPHomeChange = clientmetric.NewCounter("derp_home_change")
 
+	// metricDERPHomeNoChangeNoControl is how many times our DERP home
+	// region did not change because we didn't have an active connection to
+	// the control server.
+	metricDERPHomeNoChangeNoControl = clientmetric.NewCounter("derp_home_no_change_no_control")
+
+	// metricDERPHomeFallback is how many times we picked a DERP fallback.
+	metricDERPHomeFallback = clientmetric.NewCounter("derp_home_fallback")
+
+	// metricDERPStaleCleaned is how many times we closed a stale DERP connection.
+	metricDERPStaleCleaned = clientmetric.NewCounter("derp_stale_cleaned")
+
 	// Disco packets received bpf read path
 	//lint:ignore U1000 used on Linux only
 	metricRecvDiscoPacketIPv4 = clientmetric.NewCounter("magicsock_disco_recv_bpf_ipv4")
@@ -3026,4 +3084,24 @@ func getPeerMTUsProbedMetric(mtu tstun.WireMTU) *clientmetric.Metric {
 	key := fmt.Sprintf("magicsock_recv_disco_peer_mtu_probes_by_mtu_%d", mtu)
 	mm, _ := metricRecvDiscoPeerMTUProbesByMTU.LoadOrInit(key, func() *clientmetric.Metric { return clientmetric.NewCounter(key) })
 	return mm
+}
+
+// GetLastNetcheckReport returns the last netcheck report, running a new one if a recent one does not exist.
+func (c *Conn) GetLastNetcheckReport(ctx context.Context) *netcheck.Report {
+	lastReport := c.lastNetCheckReport.Load()
+	if lastReport == nil {
+		nr, err := c.updateNetInfo(ctx)
+		if err != nil {
+			c.logf("magicsock.Conn.GetLastNetcheckReport: updateNetInfo: %v", err)
+			return nil
+		}
+		return nr
+	}
+	return lastReport
+}
+
+// SetLastNetcheckReportForTest sets the magicsock conn's last netcheck report.
+// Used for testing purposes.
+func (c *Conn) SetLastNetcheckReportForTest(ctx context.Context, report *netcheck.Report) {
+	c.lastNetCheckReport.Store(report)
 }

@@ -92,6 +92,9 @@ func(v {{.ViewName}}) {{.FieldName}}() views.MapFn[{{.MapKeyType}},{{.MapValueTy
 	return {{.MapFn}}
 })}
 {{end}}
+{{define "mapSliceField"}}
+func(v {{.ViewName}}) {{.FieldName}}() views.MapSlice[{{.MapKeyType}},{{.MapValueType}}] { return views.MapSliceOf(v.ж.{{.FieldName}}) }
+{{end}}
 {{define "unsupportedField"}}func(v {{.ViewName}}) {{.FieldName}}() {{.FieldType}} {panic("unsupported")}
 {{end}}
 {{define "stringFunc"}}func(v {{.ViewName}}) String() string { return v.ж.String() }
@@ -149,7 +152,7 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 		}
 	}
 	writeTemplate("common")
-	for i := 0; i < t.NumFields(); i++ {
+	for i := range t.NumFields() {
 		f := t.Field(i)
 		fname := f.Name()
 		if !f.Exported() {
@@ -241,9 +244,8 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 				case *types.Basic, *types.Named:
 					sElem := it.QualifiedName(sElem)
 					args.MapValueView = fmt.Sprintf("views.Slice[%v]", sElem)
-					args.MapValueType = "[]" + sElem
-					args.MapFn = "views.SliceOf(t)"
-					template = "mapFnField"
+					args.MapValueType = sElem
+					template = "mapSliceField"
 				case *types.Pointer:
 					ptr := x
 					pElem := ptr.Elem()
@@ -292,7 +294,7 @@ func genView(buf *bytes.Buffer, it *codegen.ImportTracker, typ *types.Named, thi
 		}
 		writeTemplate("unsupportedField")
 	}
-	for i := 0; i < typ.NumMethods(); i++ {
+	for i := range typ.NumMethods() {
 		f := typ.Method(i)
 		if !f.Exported() {
 			continue

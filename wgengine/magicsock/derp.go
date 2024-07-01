@@ -7,8 +7,6 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"hash/fnv"
-	"math/rand"
 	"net"
 	"net/netip"
 	"reflect"
@@ -16,6 +14,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/derp"
@@ -31,6 +30,7 @@ import (
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/rands"
 	"tailscale.com/util/sysresources"
 	"tailscale.com/util/testenv"
 )
@@ -94,7 +94,6 @@ type activeDerp struct {
 }
 
 var (
-	processStartUnixNano     = time.Now().UnixNano()
 	pickDERPFallbackForTests func() int
 )
 
@@ -136,9 +135,8 @@ func (c *Conn) pickDERPFallback() int {
 		return pickDERPFallbackForTests()
 	}
 
-	h := fnv.New64()
-	fmt.Fprintf(h, "%p/%d", c, processStartUnixNano) // arbitrary
-	return ids[rand.New(rand.NewSource(int64(h.Sum64()))).Intn(len(ids))]
+	metricDERPHomeFallback.Add(1)
+	return ids[rands.IntN(uint64(uintptr(unsafe.Pointer(c))), len(ids))]
 }
 
 // This allows existing tests to pass, but allows us to still test the
@@ -161,16 +159,28 @@ func (c *Conn) maybeSetNearestDERP(report *netcheck.Report) (preferredDERP int) 
 	//
 	// For tests, always assume we're connected to control unless we're
 	// explicitly testing this behaviour.
+	//
+	// Despite the above behaviour, ensure that we set the nearest DERP if
+	// we don't currently have one set; any DERP server is better than
+	// none, even if not connected to control.
 	var connectedToControl bool
 	if testenv.InTest() && !checkControlHealthDuringNearestDERPInTests {
 		connectedToControl = true
 	} else {
-		connectedToControl = health.GetInPollNetMap()
+		connectedToControl = c.health.GetInPollNetMap()
 	}
 	if !connectedToControl {
 		c.mu.Lock()
-		defer c.mu.Unlock()
-		return c.myDerp
+		myDerp := c.myDerp
+		c.mu.Unlock()
+		if myDerp != 0 {
+			metricDERPHomeNoChangeNoControl.Add(1)
+			return myDerp
+		}
+
+		// Intentionally fall through; we don't have a current DERP, so
+		// as mentioned above selecting one even if not connected is
+		// strictly better than doing nothing.
 	}
 
 	preferredDERP = report.PreferredDERP
@@ -201,12 +211,12 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 	defer c.mu.Unlock()
 	if !c.wantDerpLocked() {
 		c.myDerp = 0
-		health.SetMagicSockDERPHome(0, c.homeless)
+		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
 	if c.homeless {
 		c.myDerp = 0
-		health.SetMagicSockDERPHome(0, c.homeless)
+		c.health.SetMagicSockDERPHome(0, c.homeless)
 		return false
 	}
 	if derpNum == c.myDerp {
@@ -217,7 +227,7 @@ func (c *Conn) setNearestDERP(derpNum int) (wantDERP bool) {
 		metricDERPHomeChange.Add(1)
 	}
 	c.myDerp = derpNum
-	health.SetMagicSockDERPHome(derpNum, c.homeless)
+	c.health.SetMagicSockDERPHome(derpNum, c.homeless)
 
 	if c.privateKey.IsZero() {
 		// No private key yet, so DERP connections won't come up anyway.
@@ -400,6 +410,7 @@ func (c *Conn) derpWriteChanOfAddr(addr netip.AddrPort, peer key.NodePublic) cha
 		}
 		return derpMap.Regions[regionID]
 	})
+	dc.HealthTracker = c.health
 
 	dc.SetCanAckPings(true)
 	dc.NotePreferred(c.myDerp == regionID)
@@ -525,8 +536,8 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netip.AddrPort, d
 		return n
 	}
 
-	defer health.SetDERPRegionConnectedState(regionID, false)
-	defer health.SetDERPRegionHealth(regionID, "")
+	defer c.health.SetDERPRegionConnectedState(regionID, false)
+	defer c.health.SetDERPRegionHealth(regionID, "")
 
 	// peerPresent is the set of senders we know are present on this
 	// connection, based on messages we've received from the server.
@@ -538,7 +549,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netip.AddrPort, d
 	for {
 		msg, connGen, err := dc.RecvDetail()
 		if err != nil {
-			health.SetDERPRegionConnectedState(regionID, false)
+			c.health.SetDERPRegionConnectedState(regionID, false)
 			// Forget that all these peers have routes.
 			for peer := range peerPresent {
 				delete(peerPresent, peer)
@@ -576,14 +587,14 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netip.AddrPort, d
 
 		now := time.Now()
 		if lastPacketTime.IsZero() || now.Sub(lastPacketTime) > frameReceiveRecordRate {
-			health.NoteDERPRegionReceivedFrame(regionID)
+			c.health.NoteDERPRegionReceivedFrame(regionID)
 			lastPacketTime = now
 		}
 
 		switch m := msg.(type) {
 		case derp.ServerInfoMessage:
-			health.SetDERPRegionConnectedState(regionID, true)
-			health.SetDERPRegionHealth(regionID, "") // until declared otherwise
+			c.health.SetDERPRegionConnectedState(regionID, true)
+			c.health.SetDERPRegionHealth(regionID, "") // until declared otherwise
 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
 			continue
 		case derp.ReceivedPacket:
@@ -623,7 +634,7 @@ func (c *Conn) runDerpReader(ctx context.Context, derpFakeAddr netip.AddrPort, d
 			}()
 			continue
 		case derp.HealthMessage:
-			health.SetDERPRegionHealth(regionID, m.Problem)
+			c.health.SetDERPRegionHealth(regionID, m.Problem)
 			continue
 		case derp.PeerGoneMessage:
 			switch m.Reason {
@@ -680,8 +691,10 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 }
 
 func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
-	health.ReceiveDERP.Enter()
-	defer health.ReceiveDERP.Exit()
+	if s := c.Conn.health.ReceiveFuncStats(health.ReceiveDERP); s != nil {
+		s.Enter()
+		defer s.Exit()
+	}
 
 	for dm := range c.derpRecvCh {
 		if c.isClosed() {
@@ -937,6 +950,7 @@ func (c *Conn) cleanStaleDerp() {
 		}
 		if ad.lastWrite.Before(tooOld) {
 			c.closeDerpLocked(i, "idle")
+			metricDERPStaleCleaned.Add(1)
 			dirty = true
 		} else {
 			someNonHomeOpen = true

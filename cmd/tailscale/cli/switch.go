@@ -13,30 +13,55 @@ import (
 	"time"
 
 	"github.com/peterbourgon/ff/v3/ffcli"
+	"tailscale.com/cmd/tailscale/cli/ffcomplete"
 	"tailscale.com/ipn"
 )
 
 var switchCmd = &ffcli.Command{
-	Name:      "switch",
-	ShortHelp: "Switches to a different Tailscale account",
+	Name:       "switch",
+	ShortUsage: "tailscale switch <id>",
+	ShortHelp:  "Switches to a different Tailscale account",
+	LongHelp: `"tailscale switch" switches between logged in accounts. You can
+use the ID that's returned from 'tailnet switch -list'
+to pick which profile you want to switch to. Alternatively, you
+can use the Tailnet or the account names to switch as well.
+
+This command is currently in alpha and may change in the future.`,
+
 	FlagSet: func() *flag.FlagSet {
 		fs := flag.NewFlagSet("switch", flag.ExitOnError)
 		fs.BoolVar(&switchArgs.list, "list", false, "list available accounts")
 		return fs
 	}(),
 	Exec: switchProfile,
-	UsageFunc: func(*ffcli.Command) string {
-		return `USAGE
-  switch <id>
-  switch --list
+}
 
-"tailscale switch" switches between logged in accounts. You can
-use the ID that's returned from 'tailnet switch -list'
-to pick which profile you want to switch to. Alternatively, you
-can use the Tailnet or the account names to switch as well.
+func init() {
+	ffcomplete.Args(switchCmd, func(s []string) (words []string, dir ffcomplete.ShellCompDirective, err error) {
+		_, all, err := localClient.ProfileStatus(context.Background())
+		if err != nil {
+			return nil, 0, err
+		}
 
-This command is currently in alpha and may change in the future.`
-	},
+		seen := make(map[string]bool, 3*len(all))
+		wordfns := []func(prof ipn.LoginProfile) string{
+			func(prof ipn.LoginProfile) string { return string(prof.ID) },
+			func(prof ipn.LoginProfile) string { return prof.NetworkProfile.DomainName },
+			func(prof ipn.LoginProfile) string { return prof.Name },
+		}
+
+		for _, wordfn := range wordfns {
+			for _, prof := range all {
+				word := wordfn(prof)
+				if seen[word] {
+					continue
+				}
+				seen[word] = true
+				words = append(words, fmt.Sprintf("%s\tid: %s, tailnet: %s, account: %s", word, prof.ID, prof.NetworkProfile.DomainName, prof.Name))
+			}
+		}
+		return words, ffcomplete.ShellCompDirectiveNoFileComp, nil
+	})
 }
 
 var switchArgs struct {
@@ -48,7 +73,7 @@ func listProfiles(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	tw := tabwriter.NewWriter(os.Stdout, 2, 2, 2, ' ', 0)
+	tw := tabwriter.NewWriter(Stdout, 2, 2, 2, ' ', 0)
 	defer tw.Flush()
 	printRow := func(vals ...string) {
 		fmt.Fprintln(tw, strings.Join(vals, "\t"))

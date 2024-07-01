@@ -8,7 +8,6 @@ import (
 	"flag"
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
@@ -37,9 +36,9 @@ func newFunnelCommand(e *serveEnv) *ffcli.Command {
 		Name:      "funnel",
 		ShortHelp: "Turn on/off Funnel service",
 		ShortUsage: strings.Join([]string{
-			"funnel <serve-port> {on|off}",
-			"funnel status [--json]",
-		}, "\n  "),
+			"tailscale funnel <serve-port> {on|off}",
+			"tailscale funnel status [--json]",
+		}, "\n"),
 		LongHelp: strings.Join([]string{
 			"Funnel allows you to publish a 'tailscale serve'",
 			"server publicly, open to the entire internet.",
@@ -47,17 +46,16 @@ func newFunnelCommand(e *serveEnv) *ffcli.Command {
 			"Turning off Funnel only turns off serving to the internet.",
 			"It does not affect serving to your tailnet.",
 		}, "\n"),
-		Exec:      e.runFunnel,
-		UsageFunc: usageFunc,
+		Exec: e.runFunnel,
 		Subcommands: []*ffcli.Command{
 			{
-				Name:      "status",
-				Exec:      e.runServeStatus,
-				ShortHelp: "show current serve/funnel status",
+				Name:       "status",
+				Exec:       e.runServeStatus,
+				ShortUsage: "tailscale funnel status [--json]",
+				ShortHelp:  "Show current serve/funnel status",
 				FlagSet: e.newFlags("funnel-status", func(fs *flag.FlagSet) {
 					fs.BoolVar(&e.json, "json", false, "output JSON")
 				}),
-				UsageFunc: usageFunc,
 			},
 		},
 	}
@@ -169,10 +167,10 @@ func printFunnelWarning(sc *ipn.ServeConfig) {
 		p, _ := strconv.ParseUint(portStr, 10, 16)
 		if _, ok := sc.TCP[uint16(p)]; !ok {
 			warn = true
-			fmt.Fprintf(os.Stderr, "\nWarning: funnel=on for %s, but no serve config\n", hp)
+			fmt.Fprintf(Stderr, "\nWarning: funnel=on for %s, but no serve config\n", hp)
 		}
 	}
 	if warn {
-		fmt.Fprintf(os.Stderr, "         run: `tailscale serve --help` to see how to configure handlers\n")
+		fmt.Fprintf(Stderr, "         run: `tailscale serve --help` to see how to configure handlers\n")
 	}
 }

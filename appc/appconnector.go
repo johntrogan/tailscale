@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	xmaps "golang.org/x/exp/maps"
 	"golang.org/x/net/dns/dnsmessage"
@@ -23,7 +24,48 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/execqueue"
 	"tailscale.com/util/mak"
+	"tailscale.com/util/slicesx"
 )
+
+// rateLogger responds to calls to update by adding a count for the current period and
+// calling the callback if any previous period has finished since update was last called
+type rateLogger struct {
+	interval    time.Duration
+	start       time.Time
+	periodStart time.Time
+	periodCount int64
+	now         func() time.Time
+	callback    func(int64, time.Time, int64)
+}
+
+func (rl *rateLogger) currentIntervalStart(now time.Time) time.Time {
+	millisSince := now.Sub(rl.start).Milliseconds() % rl.interval.Milliseconds()
+	return now.Add(-(time.Duration(millisSince)) * time.Millisecond)
+}
+
+func (rl *rateLogger) update(numRoutes int64) {
+	now := rl.now()
+	periodEnd := rl.periodStart.Add(rl.interval)
+	if periodEnd.Before(now) {
+		if rl.periodCount != 0 {
+			rl.callback(rl.periodCount, rl.periodStart, numRoutes)
+		}
+		rl.periodCount = 0
+		rl.periodStart = rl.currentIntervalStart(now)
+	}
+	rl.periodCount++
+}
+
+func newRateLogger(now func() time.Time, interval time.Duration, callback func(int64, time.Time, int64)) *rateLogger {
+	nowTime := now()
+	return &rateLogger{
+		callback:    callback,
+		now:         now,
+		interval:    interval,
+		start:       nowTime,
+		periodStart: nowTime,
+	}
+}
 
 // RouteAdvertiser is an interface that allows the AppConnector to advertise
 // newly discovered routes that need to be served through the AppConnector.
@@ -34,6 +76,19 @@ type RouteAdvertiser interface {
 
 	// UnadvertiseRoute removes any matching route advertisements.
 	UnadvertiseRoute(...netip.Prefix) error
+}
+
+// RouteInfo is a data structure used to persist the in memory state of an AppConnector
+// so that we can know, even after a restart, which routes came from ACLs and which were
+// learned from domains.
+type RouteInfo struct {
+	// Control is the routes from the 'routes' section of an app connector acl.
+	Control []netip.Prefix `json:",omitempty"`
+	// Domains are the routes discovered by observing DNS lookups for configured domains.
+	Domains map[string][]netip.Addr `json:",omitempty"`
+	// Wildcards are the configured DNS lookup domains to observe. When a DNS query matches Wildcards,
+	// its result is added to Domains.
+	Wildcards []string `json:",omitempty"`
 }
 
 // AppConnector is an implementation of an AppConnector that performs
@@ -48,6 +103,9 @@ type RouteAdvertiser interface {
 type AppConnector struct {
 	logf            logger.Logf
 	routeAdvertiser RouteAdvertiser
+
+	// storeRoutesFunc will be called to persist routes if it is not nil.
+	storeRoutesFunc func(*RouteInfo) error
 
 	// mu guards the fields that follow
 	mu sync.Mutex
@@ -64,14 +122,67 @@ type AppConnector struct {
 
 	// queue provides ordering for update operations
 	queue execqueue.ExecQueue
+
+	writeRateMinute *rateLogger
+	writeRateDay    *rateLogger
 }
 
 // NewAppConnector creates a new AppConnector.
-func NewAppConnector(logf logger.Logf, routeAdvertiser RouteAdvertiser) *AppConnector {
-	return &AppConnector{
+func NewAppConnector(logf logger.Logf, routeAdvertiser RouteAdvertiser, routeInfo *RouteInfo, storeRoutesFunc func(*RouteInfo) error) *AppConnector {
+	ac := &AppConnector{
 		logf:            logger.WithPrefix(logf, "appc: "),
 		routeAdvertiser: routeAdvertiser,
+		storeRoutesFunc: storeRoutesFunc,
 	}
+	if routeInfo != nil {
+		ac.domains = routeInfo.Domains
+		ac.wildcards = routeInfo.Wildcards
+		ac.controlRoutes = routeInfo.Control
+	}
+	ac.writeRateMinute = newRateLogger(time.Now, time.Minute, func(c int64, s time.Time, l int64) {
+		ac.logf("routeInfo write rate: %d in minute starting at %v (%d routes)", c, s, l)
+	})
+	ac.writeRateDay = newRateLogger(time.Now, 24*time.Hour, func(c int64, s time.Time, l int64) {
+		ac.logf("routeInfo write rate: %d in 24 hours starting at %v (%d routes)", c, s, l)
+	})
+	return ac
+}
+
+// ShouldStoreRoutes returns true if the appconnector was created with the controlknob on
+// and is storing its discovered routes persistently.
+func (e *AppConnector) ShouldStoreRoutes() bool {
+	return e.storeRoutesFunc != nil
+}
+
+// storeRoutesLocked takes the current state of the AppConnector and persists it
+func (e *AppConnector) storeRoutesLocked() error {
+	if !e.ShouldStoreRoutes() {
+		return nil
+	}
+
+	// log write rate and write size
+	numRoutes := int64(len(e.controlRoutes))
+	for _, rs := range e.domains {
+		numRoutes += int64(len(rs))
+	}
+	e.writeRateMinute.update(numRoutes)
+	e.writeRateDay.update(numRoutes)
+
+	return e.storeRoutesFunc(&RouteInfo{
+		Control:   e.controlRoutes,
+		Domains:   e.domains,
+		Wildcards: e.wildcards,
+	})
+}
+
+// ClearRoutes removes all route state from the AppConnector.
+func (e *AppConnector) ClearRoutes() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.controlRoutes = nil
+	e.domains = nil
+	e.wildcards = nil
+	return e.storeRoutesLocked()
 }
 
 // UpdateDomainsAndRoutes starts an asynchronous update of the configuration
@@ -125,10 +236,26 @@ func (e *AppConnector) updateDomains(domains []string) {
 		for _, wc := range e.wildcards {
 			if dnsname.HasSuffix(d, wc) {
 				e.domains[d] = addrs
+				delete(oldDomains, d)
 				break
 			}
 		}
 	}
+
+	// Everything left in oldDomains is a domain we're no longer tracking
+	// and if we are storing route info we can unadvertise the routes
+	if e.ShouldStoreRoutes() {
+		toRemove := []netip.Prefix{}
+		for _, addrs := range oldDomains {
+			for _, a := range addrs {
+				toRemove = append(toRemove, netip.PrefixFrom(a, a.BitLen()))
+			}
+		}
+		if err := e.routeAdvertiser.UnadvertiseRoute(toRemove...); err != nil {
+			e.logf("failed to unadvertise routes on domain removal: %v: %v: %v", xmaps.Keys(oldDomains), toRemove, err)
+		}
+	}
+
 	e.logf("handling domains: %v and wildcards: %v", xmaps.Keys(e.domains), e.wildcards)
 }
 
@@ -152,6 +279,14 @@ func (e *AppConnector) updateRoutes(routes []netip.Prefix) {
 
 	var toRemove []netip.Prefix
 
+	// If we're storing routes and know e.controlRoutes is a good
+	// representation of what should be in AdvertisedRoutes we can stop
+	// advertising routes that used to be in e.controlRoutes but are not
+	// in routes.
+	if e.ShouldStoreRoutes() {
+		toRemove = routesWithout(e.controlRoutes, routes)
+	}
+
 nextRoute:
 	for _, r := range routes {
 		for _, addr := range e.domains {
@@ -170,6 +305,9 @@ nextRoute:
 	}
 
 	e.controlRoutes = routes
+	if err := e.storeRoutesLocked(); err != nil {
+		e.logf("failed to store route info: %v", err)
+	}
 }
 
 // Domains returns the currently configured domain list.
@@ -304,8 +442,10 @@ func (e *AppConnector) ObserveDNSResponse(res []byte) {
 			}
 		}
 
-		e.logf("[v2] observed new routes for %s: %s", domain, toAdvertise)
-		e.scheduleAdvertisement(domain, toAdvertise...)
+		if len(toAdvertise) > 0 {
+			e.logf("[v2] observed new routes for %s: %s", domain, toAdvertise)
+			e.scheduleAdvertisement(domain, toAdvertise...)
+		}
 	}
 }
 
@@ -380,6 +520,9 @@ func (e *AppConnector) scheduleAdvertisement(domain string, routes ...netip.Pref
 				e.logf("[v2] advertised route for %v: %v", domain, addr)
 			}
 		}
+		if err := e.storeRoutesLocked(); err != nil {
+			e.logf("failed to store route info: %v", err)
+		}
 	})
 }
 
@@ -399,4 +542,16 @@ func (e *AppConnector) addDomainAddrLocked(domain string, addr netip.Addr) {
 
 func compareAddr(l, r netip.Addr) int {
 	return l.Compare(r)
+}
+
+// routesWithout returns a without b where a and b
+// are unsorted slices of netip.Prefix
+func routesWithout(a, b []netip.Prefix) []netip.Prefix {
+	m := make(map[netip.Prefix]bool, len(b))
+	for _, p := range b {
+		m[p] = true
+	}
+	return slicesx.Filter(make([]netip.Prefix, 0, len(a)), a, func(p netip.Prefix) bool {
+		return !m[p]
+	})
 }
