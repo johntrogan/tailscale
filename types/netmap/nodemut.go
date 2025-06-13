@@ -37,7 +37,7 @@ func (m NodeMutationDERPHome) Apply(n *tailcfg.Node) {
 	n.HomeDERP = m.DERPRegion
 }
 
-// NodeMutation is a NodeMutation that says a node's endpoints have changed.
+// NodeMutationEndpoints is a NodeMutation that says a node's endpoints have changed.
 type NodeMutationEndpoints struct {
 	mutatingNodeID
 	Endpoints []netip.AddrPort
@@ -67,6 +67,17 @@ type NodeMutationLastSeen struct {
 
 func (m NodeMutationLastSeen) Apply(n *tailcfg.Node) {
 	n.LastSeen = ptr.To(m.LastSeen)
+}
+
+// NodeMutationCap is a NodeMutation that says a node's
+// [tailcfg.CapabilityVersion] value has changed.
+type NodeMutationCap struct {
+	mutatingNodeID
+	Cap tailcfg.CapabilityVersion
+}
+
+func (m NodeMutationCap) Apply(n *tailcfg.Node) {
+	n.Cap = m.Cap
 }
 
 var peerChangeFields = sync.OnceValue(func() []reflect.StructField {
@@ -105,6 +116,8 @@ func NodeMutationsFromPatch(p *tailcfg.PeerChange) (_ []NodeMutation, ok bool) {
 			ret = append(ret, NodeMutationOnline{mutatingNodeID(p.NodeID), *p.Online})
 		case "LastSeen":
 			ret = append(ret, NodeMutationLastSeen{mutatingNodeID(p.NodeID), *p.LastSeen})
+		case "Cap":
+			ret = append(ret, NodeMutationCap{mutatingNodeID(p.NodeID), p.Cap})
 		}
 	}
 	return ret, true
@@ -163,6 +176,7 @@ func mapResponseContainsNonPatchFields(res *tailcfg.MapResponse) bool {
 		res.PacketFilters != nil ||
 		res.UserProfiles != nil ||
 		res.Health != nil ||
+		res.DisplayMessages != nil ||
 		res.SSHPolicy != nil ||
 		res.TKAInfo != nil ||
 		res.DomainDataPlaneAuditLogID != "" ||

@@ -24,6 +24,11 @@ import (
 // relayManager manages allocation, handshaking, and initial probing (disco
 // ping/pong) of [tailscale.com/net/udprelay.Server] endpoints. The zero value
 // is ready for use.
+//
+// [relayManager] methods can be called by [Conn] and [endpoint] while their .mu
+// mutexes are held. Therefore, in order to avoid deadlocks, [relayManager] must
+// never attempt to acquire those mutexes, including synchronous calls back
+// towards [Conn] or [endpoint] methods that acquire them.
 type relayManager struct {
 	initOnce sync.Once
 
@@ -107,10 +112,19 @@ type relayEndpointHandshakeWorkDoneEvent struct {
 	latency          time.Duration  // only relevant if pongReceivedFrom.IsValid()
 }
 
-// activeWorkRunLoop returns true if there is outstanding allocation or
-// handshaking work, otherwise it returns false.
-func (r *relayManager) activeWorkRunLoop() bool {
+// hasActiveWorkRunLoop returns true if there is outstanding allocation or
+// handshaking work for any endpoint, otherwise it returns false.
+func (r *relayManager) hasActiveWorkRunLoop() bool {
 	return len(r.allocWorkByEndpoint) > 0 || len(r.handshakeWorkByEndpointByServerDisco) > 0
+}
+
+// hasActiveWorkForEndpointRunLoop returns true if there is outstanding
+// allocation or handshaking work for the provided endpoint, otherwise it
+// returns false.
+func (r *relayManager) hasActiveWorkForEndpointRunLoop(ep *endpoint) bool {
+	_, handshakeWork := r.handshakeWorkByEndpointByServerDisco[ep]
+	_, allocWork := r.allocWorkByEndpoint[ep]
+	return handshakeWork || allocWork
 }
 
 // runLoop is a form of event loop. It ensures exclusive access to most of
@@ -123,9 +137,10 @@ func (r *relayManager) runLoop() {
 	for {
 		select {
 		case ep := <-r.allocateHandshakeCh:
-			r.stopWorkRunLoop(ep, stopHandshakeWorkOnlyKnownServers)
-			r.allocateAllServersRunLoop(ep)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkForEndpointRunLoop(ep) {
+				r.allocateAllServersRunLoop(ep)
+			}
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case done := <-r.allocateWorkDoneCh:
@@ -136,27 +151,27 @@ func (r *relayManager) runLoop() {
 				// overwrite pre-existing keys.
 				delete(r.allocWorkByEndpoint, done.work.ep)
 			}
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case ep := <-r.cancelWorkCh:
-			r.stopWorkRunLoop(ep, stopHandshakeWorkAllServers)
-			if !r.activeWorkRunLoop() {
+			r.stopWorkRunLoop(ep)
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case newServerEndpoint := <-r.newServerEndpointCh:
 			r.handleNewServerEndpointRunLoop(newServerEndpoint)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case done := <-r.handshakeWorkDoneCh:
 			r.handleHandshakeWorkDoneRunLoop(done)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		case discoMsgEvent := <-r.rxHandshakeDiscoMsgCh:
 			r.handleRxHandshakeDiscoMsgRunLoop(discoMsgEvent)
-			if !r.activeWorkRunLoop() {
+			if !r.hasActiveWorkRunLoop() {
 				return
 			}
 		}
@@ -164,6 +179,7 @@ func (r *relayManager) runLoop() {
 }
 
 type relayHandshakeDiscoMsgEvent struct {
+	conn  *Conn // for access to [Conn] if there is no associated [relayHandshakeWork]
 	msg   disco.Message
 	disco key.DiscoPublic
 	from  netip.AddrPort
@@ -200,7 +216,7 @@ func (r *relayManager) init() {
 		r.newServerEndpointCh = make(chan newRelayServerEndpointEvent)
 		r.rxHandshakeDiscoMsgCh = make(chan relayHandshakeDiscoMsgEvent)
 		r.runLoopStoppedCh = make(chan struct{}, 1)
-		go r.runLoop()
+		r.runLoopStoppedCh <- struct{}{}
 	})
 }
 
@@ -279,8 +295,8 @@ func (r *relayManager) handleCallMeMaybeVia(ep *endpoint, dm *disco.CallMeMaybeV
 // handleGeneveEncapDiscoMsgNotBestAddr handles reception of Geneve-encapsulated
 // disco messages if they are not associated with any known
 // [*endpoint.bestAddr].
-func (r *relayManager) handleGeneveEncapDiscoMsgNotBestAddr(dm disco.Message, di *discoInfo, src netip.AddrPort, vni uint32) {
-	relayManagerInputEvent(r, nil, &r.rxHandshakeDiscoMsgCh, relayHandshakeDiscoMsgEvent{msg: dm, disco: di.discoKey, from: src, vni: vni, at: time.Now()})
+func (r *relayManager) handleGeneveEncapDiscoMsgNotBestAddr(dm disco.Message, di *discoInfo, src epAddr) {
+	relayManagerInputEvent(r, nil, &r.rxHandshakeDiscoMsgCh, relayHandshakeDiscoMsgEvent{msg: dm, disco: di.discoKey, from: src.ap, vni: src.vni.get(), at: time.Now()})
 }
 
 // relayManagerInputEvent initializes [relayManager] if necessary, starts
@@ -311,8 +327,8 @@ func relayManagerInputEvent[T any](r *relayManager, ctx context.Context, eventCh
 }
 
 // allocateAndHandshakeAllServers kicks off allocation and handshaking of relay
-// endpoints for 'ep' on all known relay servers, canceling any existing
-// in-progress work.
+// endpoints for 'ep' on all known relay servers if there is no outstanding
+// work.
 func (r *relayManager) allocateAndHandshakeAllServers(ep *endpoint) {
 	relayManagerInputEvent(r, nil, &r.allocateHandshakeCh, ep)
 }
@@ -322,18 +338,9 @@ func (r *relayManager) stopWork(ep *endpoint) {
 	relayManagerInputEvent(r, nil, &r.cancelWorkCh, ep)
 }
 
-// stopHandshakeWorkFilter represents filters for handshake work cancellation
-type stopHandshakeWorkFilter bool
-
-const (
-	stopHandshakeWorkAllServers       stopHandshakeWorkFilter = false
-	stopHandshakeWorkOnlyKnownServers                         = true
-)
-
 // stopWorkRunLoop cancels & clears outstanding allocation and handshaking
-// work for 'ep'. Handshake work cancellation is subject to the filter supplied
-// in 'f'.
-func (r *relayManager) stopWorkRunLoop(ep *endpoint, f stopHandshakeWorkFilter) {
+// work for 'ep'.
+func (r *relayManager) stopWorkRunLoop(ep *endpoint) {
 	allocWork, ok := r.allocWorkByEndpoint[ep]
 	if ok {
 		allocWork.cancel()
@@ -342,13 +349,10 @@ func (r *relayManager) stopWorkRunLoop(ep *endpoint, f stopHandshakeWorkFilter) 
 	}
 	byServerDisco, ok := r.handshakeWorkByEndpointByServerDisco[ep]
 	if ok {
-		for disco, handshakeWork := range byServerDisco {
-			_, knownServer := r.serversByDisco[disco]
-			if knownServer || f == stopHandshakeWorkAllServers {
-				handshakeWork.cancel()
-				done := <-handshakeWork.doneCh
-				r.handleHandshakeWorkDoneRunLoop(done)
-			}
+		for _, handshakeWork := range byServerDisco {
+			handshakeWork.cancel()
+			done := <-handshakeWork.doneCh
+			r.handleHandshakeWorkDoneRunLoop(done)
 		}
 	}
 }
@@ -366,7 +370,7 @@ func (r *relayManager) handleRxHandshakeDiscoMsgRunLoop(event relayHandshakeDisc
 		ok   bool
 	)
 	apv := addrPortVNI{event.from, event.vni}
-	switch event.msg.(type) {
+	switch msg := event.msg.(type) {
 	case *disco.BindUDPRelayEndpointChallenge:
 		work, ok = r.handshakeWorkByServerDiscoVNI[serverDiscoVNI{event.disco, event.vni}]
 		if !ok {
@@ -392,7 +396,29 @@ func (r *relayManager) handleRxHandshakeDiscoMsgRunLoop(event relayHandshakeDisc
 		// Update state so that future ping/pong will route to 'work'.
 		r.handshakeWorkAwaitingPong[work] = apv
 		r.addrPortVNIToHandshakeWork[apv] = work
-	case *disco.Ping, *disco.Pong:
+	case *disco.Ping:
+		// Always TX a pong. We might not have any associated work if ping
+		// reception raced with our call to [endpoint.relayEndpointReady()], so
+		// err on the side of enabling the remote side to use this path.
+		//
+		// Conn.handlePingLocked() makes efforts to suppress duplicate pongs
+		// where the same ping can be received both via raw socket and UDP
+		// socket on Linux. We make no such efforts here as the raw socket BPF
+		// program does not support Geneve-encapsulated disco, and is also
+		// disabled by default.
+		vni := virtualNetworkID{}
+		vni.set(event.vni)
+		go event.conn.sendDiscoMessage(epAddr{ap: event.from, vni: vni}, key.NodePublic{}, event.disco, &disco.Pong{
+			TxID: msg.TxID,
+			Src:  event.from,
+		}, discoVerboseLog)
+
+		work, ok = r.addrPortVNIToHandshakeWork[apv]
+		if !ok {
+			// No outstanding work tied to this [addrPortVNI], return early.
+			return
+		}
+	case *disco.Pong:
 		work, ok = r.addrPortVNIToHandshakeWork[apv]
 		if !ok {
 			// No outstanding work tied to this [addrPortVNI], discard.
@@ -436,7 +462,13 @@ func (r *relayManager) handleHandshakeWorkDoneRunLoop(done relayEndpointHandshak
 		return
 	}
 	// This relay endpoint is functional.
-	// TODO(jwhited): Set it on done.work.ep.bestAddr if it is a betterAddr().
+	vni := virtualNetworkID{}
+	vni.set(done.work.se.VNI)
+	addr := epAddr{ap: done.pongReceivedFrom, vni: vni}
+	// ep.relayEndpointReady() must be called in a new goroutine to prevent
+	// deadlocks as it acquires [endpoint] & [Conn] mutexes. See [relayManager]
+	// docs for details.
+	go done.work.ep.relayEndpointReady(addr, done.latency)
 }
 
 func (r *relayManager) handleNewServerEndpointRunLoop(newServerEndpoint newRelayServerEndpointEvent) {
@@ -540,7 +572,7 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 	for _, addrPort := range work.se.AddrPorts {
 		if addrPort.IsValid() {
 			sentBindAny = true
-			go work.ep.c.sendDiscoMessage(addrPort, vni, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog)
+			go work.ep.c.sendDiscoMessage(epAddr{ap: addrPort, vni: vni}, key.NodePublic{}, work.se.ServerDisco, bind, discoVerboseLog)
 		}
 	}
 	if !sentBindAny {
@@ -580,9 +612,9 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 		go func() {
 			if withAnswer != nil {
 				answer := &disco.BindUDPRelayEndpointAnswer{Answer: *withAnswer}
-				work.ep.c.sendDiscoMessage(to, vni, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
+				work.ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, work.se.ServerDisco, answer, discoVerboseLog)
 			}
-			work.ep.c.sendDiscoMessage(to, vni, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
+			work.ep.c.sendDiscoMessage(epAddr{ap: to, vni: vni}, key.NodePublic{}, epDisco.key, ping, discoVerboseLog)
 		}()
 	}
 
@@ -611,6 +643,9 @@ func (r *relayManager) handshakeServerEndpoint(work *relayHandshakeWork) {
 				// latency, so send another ping. Since the handshake is
 				// complete we do not need to send an answer in front of this
 				// one.
+				//
+				// We don't need to TX a pong, that was already handled for us
+				// in handleRxHandshakeDiscoMsgRunLoop().
 				txPing(msgEvent.from, nil)
 			case *disco.Pong:
 				at, ok := sentPingAt[msg.TxID]
